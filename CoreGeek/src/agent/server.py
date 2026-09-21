@@ -1,0 +1,42 @@
+import json
+import logging
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .brain import decide
+
+LOGGER = logging.getLogger(__name__)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            response = decide(payload)
+            LOGGER.info(
+                "round %s day %s -> %d commands",
+                payload.get("roundNo"),
+                (int(payload.get("roundNo", 1)) - 1) // 130 + 1,
+                len(response.get("roleCommandMap", {})),
+            )
+            body = json.dumps(response, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            LOGGER.exception("decision failed")
+            body = json.dumps({
+                "roleCommandMap": {},
+                "prompt": "",
+                "executeCmd": "",
+            }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
+def serve(port):
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
