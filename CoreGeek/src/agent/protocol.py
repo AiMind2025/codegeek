@@ -108,6 +108,7 @@ class Unit:
     level: int
     cooldown: int
     attack_range: int
+    attack_power: int
     capacity: int
     backpack: tuple
 
@@ -122,6 +123,7 @@ class Unit:
             int(raw.get("level") or 0),
             int(raw.get("cooldown") or 0),
             int(raw.get("attackRange") or 0),
+            int(raw.get("attackPower") or 0),
             int(raw_capacity) if raw_capacity is not None else 0,
             tuple(str(item) for item in raw.get("backpack") or ()),
         )

@@ -734,7 +734,7 @@ def _best_railgun_target(tower, robots):
     best_damage = 0
     for candidate in robots:
         damage = 0
-        energy = tower.attackPower
+        energy = tower.attack_power
         for r in sorted(robots, key=lambda x: chebyshev(tower.pos, x.pos)):
             if chebyshev(tower.pos, r.pos) > tower.range_of_attack():
                 break
