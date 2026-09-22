@@ -129,6 +129,7 @@ def _try_buy_summon_orders(turn, role, commands):
 def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     commands: dict[int, dict[str, Any]] = {}
     prompt = ""
+    turn = None
     try:
         turn = Turn.load(payload)
     except Exception as e:
@@ -164,6 +165,18 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
             _record_llm_call(turn)
     except Exception as e:
         LOGGER.exception("prompt collection failed: %s", e)
+
+    # ══ 最终兜底：无论发生什么，确保每回合至少每个可控角色有一条命令 ═══
+    try:
+        if not commands:
+            for role in turn.controllable():
+                if role.unit_id not in commands:
+                    commands[role.unit_id] = {
+                        "action": "move",
+                        "targetPos": [role.pos.dump()],
+                    }
+    except Exception as e:
+        LOGGER.exception("fallback commands failed: %s", e)
 
     LOGGER.info(
         "round %s day %s -> %d commands",
