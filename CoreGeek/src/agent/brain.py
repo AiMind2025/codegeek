@@ -127,31 +127,48 @@ def _try_buy_summon_orders(turn, role, commands):
 
 
 def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    commands: dict[int, dict[str, Any]] = {}
+    prompt = ""
     try:
         turn = Turn.load(payload)
-        commands: dict[int, dict[str, Any]] = {}
-        prompt = ""
-        # 自动重试：上回合失败的指令，本回合尝试替代方案
+    except Exception as e:
+        LOGGER.exception("Turn.load failed: %s", e)
+        return {"roleCommandMap": {}, "prompt": "", "executeCmd": ""}
+
+    # 自动重试（独立 try，失败不影响主逻辑）
+    try:
         _auto_retry(turn, commands)
+    except Exception as e:
+        LOGGER.exception("_auto_retry failed: %s", e)
+
+    # 主决策（独立 try）
+    try:
         if turn.is_day:
             _day(turn, commands)
         else:
             _night(turn, commands)
-        # 收集 LLM prompt（任务执行 + 宝藏解析）
+    except Exception as e:
+        LOGGER.exception("day/night decision failed: %s", e)
+
+    # 收集 LLM prompt
+    try:
         prompt = (
             getattr(_pioneer_do_task, "_pending_prompt", "")
             or getattr(_try_summon_treasure, "_pending_prompt", "")
         )
         _pioneer_do_task._pending_prompt = ""
         _try_summon_treasure._pending_prompt = ""
-        # 上回合失败指令的重试提示（LLM兜底）
         retry_hint = _retry_hint(turn)
         if retry_hint and not prompt and _can_use_llm(turn):
             prompt = retry_hint
             _record_llm_call(turn)
-    except Exception:
-        commands = {}
-        prompt = ""
+    except Exception as e:
+        LOGGER.exception("prompt collection failed: %s", e)
+
+    LOGGER.info(
+        "round %s day %s -> %d commands",
+        turn.round_no, turn.day_number, len(commands),
+    )
     return {
         "roleCommandMap": {str(k): v for k, v in commands.items()},
         "prompt": prompt,
@@ -160,33 +177,11 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _auto_retry(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
-    """上回合失败指令的自动替代方案（不使用LLM）"""
+    """上回合失败指令的记录（实际替代方案由 _day/_night 中的 fallback 处理）"""
+    # 只做日志记录，不在此发命令（避免与 _day/_night 冲突）
     for uid, ok in turn.last_action_results.items():
-        if ok:
-            continue
-        # 找到失败的角色
-        role = None
-        for u in turn.ours:
-            if u.unit_id == uid:
-                role = u
-                break
-        if role is None:
-            continue
-        # 常见失败原因及替代方案：
-        # 1. 移动碰撞 → 原地待命
-        # 2. 建造失败（非白天/非工人/距离>1）→ 采石头
-        # 3. 攻击失败（白天使用了attack）→ 走向武器
-        # 4. 采集失败（非工人/不在矿点旁）→ 走向最近矿点
-        if role.kind == WORKER:
-            # 工人失败 → 采石头兜底
-            _mine_stone(turn, role, set(), commands)
-        elif role.kind == PIONEER:
-            # 开拓者失败 → 回基地
-            station = turn.station()
-            if station:
-                step = _step_toward(turn, role, station.pos, set())
-                if step:
-                    commands[role.unit_id] = move_command(step)
+        if not ok:
+            LOGGER.info("last round action failed for role %s", uid)
 
 
 def _retry_hint(turn: Turn) -> str:
@@ -223,18 +218,37 @@ def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
     workers = turn.workers()
     day = turn.day_number
 
+    # 每个工人独立 try，一个失败不影响另一个
     if day <= 2:
         for w in workers:
-            _worker_build_tower(turn, w, tower_sites, free_towers, claimed, commands)
+            try:
+                _worker_build_tower(turn, w, tower_sites, free_towers, claimed, commands)
+            except Exception as e:
+                LOGGER.exception("worker build_tower failed (id=%s): %s", w.unit_id, e)
     else:
         if len(workers) >= 1:
-            _worker_miner(turn, workers[0], free_towers, free_walls, claimed, commands)
+            try:
+                _worker_miner(turn, workers[0], free_towers, free_walls, claimed, commands)
+            except Exception as e:
+                LOGGER.exception("worker miner failed (id=%s): %s", workers[0].unit_id, e)
         if len(workers) >= 2:
-            _worker_flex(turn, workers[1], free_walls, claimed, commands)
+            try:
+                _worker_flex(turn, workers[1], free_walls, claimed, commands)
+            except Exception as e:
+                LOGGER.exception("worker flex failed (id=%s): %s", workers[1].unit_id, e)
 
     pioneer = _find_pioneer(turn)
     if pioneer is not None:
-        _pioneer_day(turn, pioneer, claimed, commands)
+        try:
+            _pioneer_day(turn, pioneer, claimed, commands)
+        except Exception as e:
+            LOGGER.exception("pioneer day failed (id=%s): %s", pioneer.unit_id, e)
+
+    # ─ 安全网：如果没有任何命令，给每个可控角色发原地待命 ──
+    if not commands:
+        for role in turn.controllable():
+            if role.unit_id not in commands:
+                commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
 
 def _worker_build_tower(turn, role, sites, free_towers, claimed, commands):
@@ -448,7 +462,11 @@ def _try_summon_treasure(turn, role, claimed, commands):
 
     # 上回合 LLM 返回了解析结果
     if turn.llm_resp:
-        return _process_treasure_llm_result(turn, role, claimed, commands)
+        try:
+            return _process_treasure_llm_result(turn, role, claimed, commands)
+        except Exception as e:
+            LOGGER.exception("treasure llm result parse failed: %s", e)
+            return False
 
     # 检查 LLM 配额（非任务期间每游戏日限3次）
     if not _can_use_llm(turn):
@@ -573,6 +591,11 @@ def _night(turn, commands):
         step = _step_toward(turn, role, nearest.pos, claimed)
         if step is not None:
             commands[role.unit_id] = move_command(step)
+
+    #  安全网：无命令时发原地待命 ──
+    if not commands:
+        for role in controllable:
+            commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
 
 def _best_unassigned_weapon(role, weapons, assigned_weapons):
