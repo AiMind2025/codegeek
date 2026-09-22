@@ -245,22 +245,30 @@ def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
 
     # 每个工人独立 try，一个失败不影响另一个
     if day <= 2:
-        for w in workers:
-            try:
-                _worker_build_tower(turn, w, tower_sites, free_towers, claimed, commands)
-            except Exception as e:
-                LOGGER.exception("worker build_tower failed (id=%s): %s", w.unit_id, e)
-    else:
+        # 前两天：工人1建炮台，工人2采石头备料
         if len(workers) >= 1:
             try:
-                _worker_miner(turn, workers[0], free_towers, free_walls, claimed, commands)
+                _worker_builder(turn, workers[0], free_towers, free_walls, claimed, commands)
             except Exception as e:
-                LOGGER.exception("worker miner failed (id=%s): %s", workers[0].unit_id, e)
+                LOGGER.exception("worker builder failed (id=%s): %s", workers[0].unit_id, e)
         if len(workers) >= 2:
             try:
-                _worker_flex(turn, workers[1], free_walls, claimed, commands)
+                _mine_stone(turn, workers[1], claimed, commands)
             except Exception as e:
-                LOGGER.exception("worker flex failed (id=%s): %s", workers[1].unit_id, e)
+                LOGGER.exception("worker stone failed (id=%s): %s", workers[1].unit_id, e)
+    else:
+        # 工人1：采石头 + 建围墙
+        if len(workers) >= 1:
+            try:
+                _worker_builder(turn, workers[0], free_towers, free_walls, claimed, commands)
+            except Exception as e:
+                LOGGER.exception("worker builder failed (id=%s): %s", workers[0].unit_id, e)
+        # 工人2：采铜铁 + 售卖
+        if len(workers) >= 2:
+            try:
+                _worker_miner_seller(turn, workers[1], free_towers, claimed, commands)
+            except Exception as e:
+                LOGGER.exception("worker miner_seller failed (id=%s): %s", workers[1].unit_id, e)
 
     pioneer = _find_pioneer(turn)
     if pioneer is not None:
@@ -307,59 +315,54 @@ def _worker_build_tower(turn, role, sites, free_towers, claimed, commands):
     _mine_stone(turn, role, claimed, commands)
 
 
-def _worker_miner(turn, role, free_towers, free_walls, claimed, commands):
-    """工人1：优先采高价值矿（铁/铜），兼顾建塔"""
+def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
+    """工人1：采石头 + 建围墙 + 建炮台"""
+    # 优先建炮台
     if free_towers and turn.gold >= WEAPON_BUILD_COST:
         for idx, site in enumerate(_tower_sites(turn)):
             if site in free_towers and site not in claimed:
                 tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
                 _build_or_walk(turn, role, site, tower_name, claimed, commands)
                 return
-    if role.backpack_almost_full:
-        _go_sell(turn, role, claimed, commands)
-        return
-
-    iron = role.backpack.count("iron")
-    copper = role.backpack.count("copper")
-    stones = role.backpack.count(WALL_MATERIAL)
-
-    # 优先采铁铜（高价值），而不是只采石头
-    if iron < 8:
-        _mine_ore(turn, role, "iron", claimed, commands)
-        return
-    if copper < 8:
-        _mine_ore(turn, role, "copper", claimed, commands)
-        return
-    # 铁铜够了，补充石头用于建墙
-    if stones < STONE_BATCH:
-        _mine_stone(turn, role, claimed, commands)
-        return
-    _mine_stone(turn, role, claimed, commands)
-
-
-def _worker_flex(turn, role, free_walls, claimed, commands):
-    """工人2：采石头 → 建围墙 → 卖矿 → 买升级"""
-    if role.backpack:
-        _go_sell(turn, role, claimed, commands)
-        return
-    # 白天使用升级券
-    if _try_use_upgrade_vouchers(turn, role, commands):
-        return
-    # 有石头就建墙（优先于买东西）
+    # 有石头就建墙
     stones = role.backpack.count(WALL_MATERIAL)
     if stones > 0 and free_walls:
         for site in free_walls:
             if site not in claimed:
                 _build_or_walk(turn, role, site, WALL, claimed, commands)
                 return
-    # 购买机器人召唤令（骚扰敌方）
-    if _try_buy_summon_orders(turn, role, commands):
-        return
-    # 金币够就买升级用品
-    if turn.gold >= 100 and turn.day_number >= 3:
-        _go_buy_upgrade(turn, role, claimed, commands)
+    # 背包满就去卖
+    if role.backpack_almost_full:
+        _go_sell(turn, role, claimed, commands)
         return
     # 兜底：采石头
+    _mine_stone(turn, role, claimed, commands)
+
+
+def _worker_miner_seller(turn, role, free_towers, claimed, commands):
+    """工人2：采铜/铁矿 + 售卖赚钱"""
+    # 优先建炮台（如果有空缺）
+    if free_towers and turn.gold >= WEAPON_BUILD_COST:
+        for idx, site in enumerate(_tower_sites(turn)):
+            if site in free_towers and site not in claimed:
+                tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
+                _build_or_walk(turn, role, site, tower_name, claimed, commands)
+                return
+    # 背包有矿就去卖
+    if role.backpack:
+        _go_sell(turn, role, claimed, commands)
+        return
+    # 采铜（价值最高）
+    copper = role.backpack.count("copper")
+    if copper < 10:
+        _mine_ore(turn, role, "copper", claimed, commands)
+        return
+    # 采铁
+    iron = role.backpack.count("iron")
+    if iron < 10:
+        _mine_ore(turn, role, "iron", claimed, commands)
+        return
+    # 铜铁都够了，采石头
     _mine_stone(turn, role, claimed, commands)
 
 
