@@ -1,6 +1,7 @@
 """
 决策核心 — 分阶段调度白天/夜晚行为
 """
+import logging
 from typing import Any
 
 from .grid import next_step
@@ -26,7 +27,12 @@ from .protocol import (
     sell_command,
     station_footprint,
     use_command,
+    accept_task_command,
+    submit_answer_command,
+    summon_treasure_command,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 TOWER_LOADOUT = ("gatling", "railgun", "rocket")
 STONE_BATCH = 10
@@ -36,22 +42,170 @@ _NEIGHBOUR_STEPS = (
     (1, -1),  (1, 0),  (1, 1),
 )
 
+# ── LLM 调用计数（每游戏日限3次，任务期间不限） ──
+_llm_call_count = {"day": 0, "count": 0}
+MAX_LLM_CALLS_PER_DAY = 3
+
+
+def _can_use_llm(turn: Turn) -> bool:
+    """检查是否还能调用 LLM（非任务期间每游戏日限3次）"""
+    current_day = turn.day_number
+    if _llm_call_count["day"] != current_day:
+        _llm_call_count["day"] = current_day
+        _llm_call_count["count"] = 0
+    return _llm_call_count["count"] < MAX_LLM_CALLS_PER_DAY
+
+
+def _record_llm_call(turn: Turn) -> None:
+    _llm_call_count["day"] = turn.day_number
+    _llm_call_count["count"] += 1
+
+
+# ── 官方新闻分析 ───────────────────────────────────────
+
+def _analyze_ore_news(turn: Turn) -> dict[str, int]:
+    """分析官方消息，返回矿石优先级加成 {ore_type: bonus}
+
+    关键词匹配（中文）：
+    - 提到某矿石+停工/短缺/无法采集 → 该矿石价格会上涨 → 优先采集
+    - 提到某矿石+恢复/复产 → 价格回落 → 正常优先级
+    """
+    news = turn.official_news
+    if not news or news == "今日无重大新闻":
+        return {}
+
+    bonuses: dict[str, int] = {}
+    # 铁矿波动检测
+    if any(kw in news for kw in ("铁矿", "铁矿区", "铁矿脉")):
+        if any(kw in news for kw in ("停工", "塌方", "短缺", "无法采集", "修复")):
+            bonuses["iron"] = 10  # 铁涨价，优先采
+        elif any(kw in news for kw in ("恢复", "复产", "重新开放")):
+            bonuses["iron"] = -5  # 铁降价，降低优先级
+
+    # 铜矿波动
+    if any(kw in news for kw in ("铜矿", "铜矿区")):
+        if any(kw in news for kw in ("停工", "塌方", "短缺", "无法采集")):
+            bonuses["copper"] = 10
+        elif any(kw in news for kw in ("恢复", "复产")):
+            bonuses["copper"] = -5
+
+    # 石矿波动
+    if any(kw in news for kw in ("石矿", "采石")):
+        if any(kw in news for kw in ("停工", "塌方", "短缺")):
+            bonuses["stone"] = 10
+        elif any(kw in news for kw in ("恢复", "复产")):
+            bonuses["stone"] = -5
+
+    return bonuses
+
+
+# ── 机器人召唤令 ────────────────────────────────────────
+
+def _try_buy_summon_orders(turn, role, commands):
+    """白天购买机器人召唤令骚扰敌方"""
+    if role.backpack_full:
+        return False
+    # 只在夜晚来临前购买（白天回合数 > 50 时开始准备）
+    if turn.round_in_day < 55:
+        return False
+
+    gold = turn.gold
+    # 优先级：BOSS > 大型 > 中型 > 小型
+    summon_orders = [
+        ("BossRobotSummonOrder", 200),
+        ("LargeRobotSummonOrder", 100),
+        ("MiddleRobotSummonOrder", 30),
+        ("SmallRobotSummonOrder", 20),
+    ]
+    for name, price in summon_orders:
+        if name in role.backpack:
+            continue  # 已有，不要重复买
+        if gold >= price:
+            commands[role.unit_id] = buy_command(name, 1)
+            return True
+    return False
+
 
 def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     try:
         turn = Turn.load(payload)
         commands: dict[int, dict[str, Any]] = {}
+        prompt = ""
+        # 自动重试：上回合失败的指令，本回合尝试替代方案
+        _auto_retry(turn, commands)
         if turn.is_day:
             _day(turn, commands)
         else:
             _night(turn, commands)
+        # 收集 LLM prompt（任务执行 + 宝藏解析）
+        prompt = (
+            getattr(_pioneer_do_task, "_pending_prompt", "")
+            or getattr(_try_summon_treasure, "_pending_prompt", "")
+        )
+        _pioneer_do_task._pending_prompt = ""
+        _try_summon_treasure._pending_prompt = ""
+        # 上回合失败指令的重试提示（LLM兜底）
+        retry_hint = _retry_hint(turn)
+        if retry_hint and not prompt and _can_use_llm(turn):
+            prompt = retry_hint
+            _record_llm_call(turn)
     except Exception:
         commands = {}
+        prompt = ""
     return {
         "roleCommandMap": {str(k): v for k, v in commands.items()},
-        "prompt": "",
+        "prompt": prompt,
         "executeCmd": "",
     }
+
+
+def _auto_retry(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
+    """上回合失败指令的自动替代方案（不使用LLM）"""
+    for uid, ok in turn.last_action_results.items():
+        if ok:
+            continue
+        # 找到失败的角色
+        role = None
+        for u in turn.ours:
+            if u.unit_id == uid:
+                role = u
+                break
+        if role is None:
+            continue
+        # 常见失败原因及替代方案：
+        # 1. 移动碰撞 → 原地待命
+        # 2. 建造失败（非白天/非工人/距离>1）→ 采石头
+        # 3. 攻击失败（白天使用了attack）→ 走向武器
+        # 4. 采集失败（非工人/不在矿点旁）→ 走向最近矿点
+        if role.kind == WORKER:
+            # 工人失败 → 采石头兜底
+            _mine_stone(turn, role, set(), commands)
+        elif role.kind == PIONEER:
+            # 开拓者失败 → 回基地
+            station = turn.station()
+            if station:
+                step = _step_toward(turn, role, station.pos, set())
+                if step:
+                    commands[role.unit_id] = move_command(step)
+
+
+def _retry_hint(turn: Turn) -> str:
+    """根据上回合失败结果生成 LLM 重试提示"""
+    failed = [uid for uid, ok in turn.last_action_results.items() if not ok]
+    if not failed:
+        return ""
+    failed_types = []
+    for uid in failed:
+        for unit in turn.ours:
+            if unit.unit_id == uid:
+                failed_types.append(f"{unit.kind}(id={uid})")
+                break
+    if not failed_types:
+        return ""
+    return (
+        f"上回合以下角色指令执行失败：{', '.join(failed_types)}。"
+        f"请分析可能原因并给出替代方案。"
+    )
 
 
 def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
@@ -106,8 +260,22 @@ def _worker_miner(turn, role, free_towers, free_walls, claimed, commands):
     if stones < STONE_BATCH:
         _mine_stone(turn, role, claimed, commands)
         return
+
+    # 根据官方新闻调整采矿优先级
+    ore_bonuses = _analyze_ore_news(turn)
     iron = role.backpack.count("iron")
     copper = role.backpack.count("copper")
+
+    # 铁有涨价新闻 → 优先采铁
+    if ore_bonuses.get("iron", 0) > 0 and iron < 10:
+        _mine_ore(turn, role, "iron", claimed, commands)
+        return
+    # 铜有涨价新闻 → 优先采铜
+    if ore_bonuses.get("copper", 0) > 0 and copper < 10:
+        _mine_ore(turn, role, "copper", claimed, commands)
+        return
+
+    # 默认优先级
     if iron < 5:
         _mine_ore(turn, role, "iron", claimed, commands)
         return
@@ -120,6 +288,12 @@ def _worker_miner(turn, role, free_towers, free_walls, claimed, commands):
 def _worker_flex(turn, role, free_walls, claimed, commands):
     if role.backpack:
         _go_sell(turn, role, claimed, commands)
+        return
+    # 白天使用升级券
+    if _try_use_upgrade_vouchers(turn, role, commands):
+        return
+    # 购买机器人召唤令（骚扰敌方）
+    if _try_buy_summon_orders(turn, role, commands):
         return
     if turn.gold >= 100 and turn.day_number >= 3:
         _go_buy_upgrade(turn, role, claimed, commands)
@@ -134,11 +308,218 @@ def _worker_flex(turn, role, free_walls, claimed, commands):
 
 
 def _pioneer_day(turn, role, claimed, commands):
+    # 1. 如果有正在执行的任务，提交答案
+    if turn.has_active_task():
+        _pioneer_do_task(turn, role, claimed, commands)
+        return
+
+    # 2. 有可领取的任务，前往任务点领取
+    valid_tasks = turn.valid_tasks()
+    if valid_tasks:
+        _pioneer_go_task(turn, role, valid_tasks, claimed, commands)
+        return
+
+    # 3. 没有任务时：购买任务用品 + 探索
+    _pioneer_idle(turn, role, claimed, commands)
+
+
+# ── 开拓者任务系统 ─────────────────────────────────────
+
+def _pioneer_do_task(turn, role, claimed, commands):
+    """执行已领取的自进化任务：用 LLM 获取答案并提交"""
+    task = turn.phase_task
+    if not task:
+        return
+
+    # 如果背包中有 Medicine 且血量低，先用药
+    if "Medicine" in role.backpack and role.health < 110:
+        commands[role.unit_id] = use_command("Medicine")
+        return
+
+    # 上回合 LLM 返回了答案，直接提交
+    if turn.llm_resp:
+        commands[role.unit_id] = submit_answer_command(turn.llm_resp)
+        return
+
+    # 任务期间 LLM 不限次数
+    prompt = (
+        f"你是一个自进化AI助手。当前任务：\n{task}\n\n"
+        f"请给出简洁的答案，只输出答案内容，不要解释。"
+    )
+    _pioneer_do_task._pending_prompt = prompt
+    _record_llm_call(turn)
+    commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
+
+
+# 存储待发送的 prompt
+_pioneer_do_task._pending_prompt = ""
+
+
+def _pioneer_go_task(turn, role, valid_tasks, claimed, commands):
+    """前往任务点领取任务"""
+    # 选择奖励最高的有效任务
+    best = max(valid_tasks, key=lambda t: (t.score_reward, t.gold_reward))
+    target = best.task_position
+
+    # 任务点2占2格，到达任一格子即可
+    if chebyshev(role.pos, target) <= 1:
+        commands[role.unit_id] = accept_task_command()
+        return
+
+    step = _step_toward(turn, role, target, claimed)
+    if step is not None:
+        commands[role.unit_id] = move_command(step)
+
+
+def _pioneer_idle(turn, role, claimed, commands):
+    """开拓者空闲时：购买任务用品 + 宝藏召唤 + 巡逻"""
+    # 0. 优先尝试宝藏召唤
+    if _try_summon_treasure(turn, role, claimed, commands):
+        return
+
     shop = turn.weapon_shop_pos()
-    if shop is not None and chebyshev(role.pos, shop) > 4:
-        step = _step_toward(turn, role, shop, claimed)
+
+    # 1. 如果背包有空位且有金币，去购买任务用品
+    task_items = [
+        "AcientTablet", "StarSand", "FlameBreath",
+        "FrostPotion", "ThornAmulet", "IronWhistle",
+    ]
+    needed_items = [i for i in task_items if i not in role.backpack]
+
+    if needed_items and turn.gold >= 15 and shop:
+        if chebyshev(role.pos, shop) <= 1:
+            commands[role.unit_id] = buy_command(needed_items[0], 1)
+            return
+        else:
+            step = _step_toward(turn, role, shop, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
+                return
+
+    # 2. 没有东西买时，往任务点方向巡逻
+    valid_tasks = turn.valid_tasks()
+    if valid_tasks:
+        best = max(valid_tasks, key=lambda t: t.score_reward)
+        if chebyshev(role.pos, best.task_position) > 5:
+            step = _step_toward(turn, role, best.task_position, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
+                return
+
+    # 3. 完全空闲，往基地方向靠拢
+    station = turn.station()
+    if station and chebyshev(role.pos, station.pos) > 6:
+        step = _step_toward(turn, role, station.pos, claimed)
         if step is not None:
             commands[role.unit_id] = move_command(step)
+
+
+# ── 夜晚开拓者行为 ──────────────────────────────────────
+
+def _pioneer_night(turn, role, claimed, commands):
+    """夜晚开拓者应回到基地附近安全位置"""
+    station = turn.station()
+    if station is None:
+        return
+    # 优先回到有武器的位置
+    weapons = turn.weapons()
+    if weapons:
+        nearest_weapon = min(weapons, key=lambda w: chebyshev(role.pos, w.pos))
+        if chebyshev(role.pos, nearest_weapon.pos) > 1:
+            step = _step_toward(turn, role, nearest_weapon.pos, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
+
+
+# ── 宝藏召唤系统 ────────────────────────────────────────
+
+# 任务用品全集
+_ALL_TASK_ITEMS = (
+    "AcientTablet", "StarSand", "FlameBreath",
+    "FrostPotion", "ThornAmulet", "IronWhistle",
+)
+
+
+def _try_summon_treasure(turn, role, claimed, commands):
+    """尝试召唤宝藏：解析传闻 → 定位祭坛 → 带齐物品 → 召唤"""
+    legends = turn.folk_legends
+    if not legends:
+        return False
+
+    # 上回合 LLM 返回了解析结果
+    if turn.llm_resp:
+        return _process_treasure_llm_result(turn, role, claimed, commands)
+
+    # 检查 LLM 配额（非任务期间每游戏日限3次）
+    if not _can_use_llm(turn):
+        return False
+
+    prompt = (
+        f"分析以下民间传闻，提取宝藏信息：\n{legends}\n\n"
+        f"输出JSON格式：\n"
+        f'{{"altar_pos": {{"x": int, "y": int}}, '
+        f'"required_items": ["item1", "item2", ...], '
+        f'"open_day": int 或 null}}\n'
+        f"如果信息不足以确定，required_items 列出所有6种任务用品。"
+    )
+    _try_summon_treasure._pending_prompt = prompt
+    _record_llm_call(turn)
+    return False
+
+
+_try_summon_treasure._pending_prompt = ""
+
+
+def _process_treasure_llm_result(turn, role, claimed, commands):
+    """处理 LLM 返回的宝藏解析结果"""
+    import json
+    raw = turn.llm_resp.strip()
+
+    # 尝试提取 JSON
+    try:
+        # 找到第一个 { 到最后一个 }
+        start = raw.index("{")
+        end = raw.rindex("}") + 1
+        data = json.loads(raw[start:end])
+    except (ValueError, json.JSONDecodeError):
+        return False
+
+    altar_pos_raw = data.get("altar_pos")
+    required_items = data.get("required_items", list(_ALL_TASK_ITEMS))
+
+    if not altar_pos_raw:
+        return False
+
+    altar = Pos(int(altar_pos_raw["x"]), int(altar_pos_raw["y"]))
+
+    # 检查背包中有哪些所需物品
+    have_items = [i for i in required_items if i in role.backpack]
+    need_items = [i for i in required_items if i not in role.backpack]
+
+    # 如果还缺物品，去购买
+    if need_items:
+        shop = turn.weapon_shop_pos()
+        if shop and turn.gold >= 15:
+            if chebyshev(role.pos, shop) <= 1:
+                commands[role.unit_id] = buy_command(need_items[0], 1)
+                return True
+            else:
+                step = _step_toward(turn, role, shop, claimed)
+                if step is not None:
+                    commands[role.unit_id] = move_command(step)
+                    return True
+        return False
+
+    # 物品齐全，前往祭坛
+    if chebyshev(role.pos, altar) <= 1:
+        commands[role.unit_id] = summon_treasure_command(altar, have_items)
+        return True
+    else:
+        step = _step_toward(turn, role, altar, claimed)
+        if step is not None:
+            commands[role.unit_id] = move_command(step)
+            return True
+        return False
 
 
 def _night(turn, commands):
@@ -147,30 +528,122 @@ def _night(turn, commands):
         r for r in turn.robots
         if r.target_team == turn.team_type and not r.is_dizzy
     )
-    pairs = list(zip(turn.controllable(), turn.weapons()))
-    for role, tower in pairs:
-        dist = chebyshev(role.pos, tower.pos)
-        if dist <= 1:
-            if tower.cooldown > 0:
-                continue
-            targets = _select_attack_targets(tower, enemy_robots, turn)
-            if targets:
-                commands[tower.unit_id] = attack_command(role.unit_id, targets)
-        else:
-            step = _step_toward(turn, role, tower.pos, claimed)
-            if step is not None:
-                commands[role.unit_id] = move_command(step)
+    weapons = turn.weapons()
+    controllable = turn.controllable()
 
-    used_roles = {r.unit_id for r, _ in pairs}
-    for role in turn.controllable():
-        if role.unit_id in used_roles:
+    # ── 角色物品使用（夜晚优先保命） ──
+    for role in controllable:
+        _role_use_items_night(turn, role, enemy_robots, commands)
+
+    # ── 优先工人配对武器 ─
+    workers = turn.workers()
+    pioneer = _find_pioneer(turn)
+    assigned_roles: set[int] = set()
+    assigned_weapons: set[int] = set()
+
+    for worker in workers:
+        if worker.unit_id in assigned_roles:
             continue
-        nearest = min(turn.weapons(), key=lambda t: chebyshev(role.pos, t.pos))
+        weapon = _best_unassigned_weapon(worker, weapons, assigned_weapons)
+        if weapon is None:
+            continue
+        _operate_or_approach(turn, worker, weapon, enemy_robots, claimed, commands)
+        assigned_roles.add(worker.unit_id)
+        assigned_weapons.add(weapon.unit_id)
+
+    # ── 开拓者配对剩余武器 ──
+    if pioneer is not None and pioneer.unit_id not in assigned_roles:
+        weapon = _best_unassigned_weapon(pioneer, weapons, assigned_weapons)
+        if weapon is not None:
+            _operate_or_approach(turn, pioneer, weapon, enemy_robots, claimed, commands)
+            assigned_roles.add(pioneer.unit_id)
+            assigned_weapons.add(weapon.unit_id)
+        else:
+            _pioneer_night(turn, pioneer, claimed, commands)
+
+    # ── 未配对角色前往最近武器 ──
+    for role in controllable:
+        if role.unit_id in assigned_roles:
+            continue
+        if not weapons:
+            continue
+        nearest = min(weapons, key=lambda t: chebyshev(role.pos, t.pos))
         if chebyshev(role.pos, nearest.pos) <= 1:
             continue
         step = _step_toward(turn, role, nearest.pos, claimed)
         if step is not None:
             commands[role.unit_id] = move_command(step)
+
+
+def _best_unassigned_weapon(role, weapons, assigned_weapons):
+    """为角色选择最近的未分配武器"""
+    candidates = [w for w in weapons if w.unit_id not in assigned_weapons]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda w: chebyshev(role.pos, w.pos))
+
+
+def _operate_or_approach(turn, role, weapon, enemy_robots, claimed, commands):
+    """角色操作武器或走向武器"""
+    dist = chebyshev(role.pos, weapon.pos)
+    if dist <= 1:
+        if weapon.cooldown > 0:
+            return
+        targets = _select_attack_targets(weapon, enemy_robots, turn)
+        if targets:
+            commands[weapon.unit_id] = attack_command(role.unit_id, targets)
+    else:
+        step = _step_toward(turn, role, weapon.pos, claimed)
+        if step is not None:
+            commands[role.unit_id] = move_command(step)
+
+
+def _role_use_items_night(turn, role, enemy_robots, commands):
+    """夜晚角色自动使用物品"""
+    if role.unit_id in commands:
+        return
+
+    bp = role.backpack
+
+    # 使用机器人召唤令（夜晚第一回合使用，叠加到敌方夜晚）
+    summon_orders = [
+        "BossRobotSummonOrder", "LargeRobotSummonOrder",
+        "MiddleRobotSummonOrder", "SmallRobotSummonOrder",
+    ]
+    if turn.is_night_first_round:
+        for order in summon_orders:
+            if order in bp:
+                commands[role.unit_id] = use_command(order)
+                return
+
+    # 血量低用药
+    if "Medicine" in bp and role.health < 110:
+        commands[role.unit_id] = use_command("Medicine")
+        return
+
+    # 机器人密集时用范围炸弹
+    if "Bomb" in bp and enemy_robots:
+        cluster = _find_robot_cluster(enemy_robots)
+        if cluster is not None:
+            commands[role.unit_id] = use_command("Bomb", cluster)
+            return
+
+    # 机器人密集时用眩晕法宝
+    if "DizzyWeapon" in bp and enemy_robots:
+        cluster = _find_robot_cluster(enemy_robots)
+        if cluster is not None:
+            commands[role.unit_id] = use_command("DizzyWeapon", cluster)
+            return
+
+
+def _find_robot_cluster(robots):
+    """找到机器人最密集的中心位置"""
+    if not robots:
+        return None
+    # 简单方法：取所有机器人坐标的平均值
+    cx = sum(r.pos.x for r in robots) // len(robots)
+    cy = sum(r.pos.y for r in robots) // len(robots)
+    return Pos(cx, cy)
 
 
 def _select_attack_targets(tower, robots, turn):
@@ -288,7 +761,13 @@ def _go_sell(turn, role, claimed, commands):
         return
     if chebyshev(role.pos, vendor) <= 1:
         prices = turn.vendor_prices
-        items = sorted(set(role.backpack), key=lambda n: prices.get(n, 0), reverse=True)
+        # 官方新闻加成：涨价矿石优先卖
+        bonuses = _analyze_ore_news(turn)
+        items = sorted(
+            set(role.backpack),
+            key=lambda n: prices.get(n, 0) + bonuses.get(n, 0),
+            reverse=True,
+        )
         if items:
             for item in items:
                 count = role.backpack.count(item)
@@ -352,6 +831,61 @@ def _buy_priority(turn, role, commands):
     if low_hp_roles and gold >= 10 and "Medicine" not in role.backpack:
         commands[role.unit_id] = buy_command("Medicine", 1)
         return
+
+
+def _try_use_upgrade_vouchers(turn, role, commands):
+    """白天自动使用背包中的升级券/消耗品（需要角色在目标建筑 1 格内）"""
+    bp = role.backpack
+
+    # 使用 Medicine（无需指定位置）
+    if "Medicine" in bp and role.health < 200:
+        commands[role.unit_id] = use_command("Medicine")
+        return True
+
+    # 使用武器升级券 — 需要角色在武器 1 格内
+    for voucher, level_check in [
+        ("WeaponUpgradeVoucher1", 1),
+        ("WeaponUpgradeVoucher2", 2),
+    ]:
+        if voucher not in bp:
+            continue
+        for w in turn.weapons():
+            if w.level == level_check and chebyshev(role.pos, w.pos) <= 1:
+                commands[role.unit_id] = use_command(voucher, w.pos)
+                return True
+
+    # 使用基地升级券
+    station = turn.station()
+    if station:
+        for voucher, level_check in [
+            ("StationUpgradeVoucher1", 1),
+            ("StationUpgradeVoucher2", 2),
+        ]:
+            if voucher in bp and station.level == level_check and chebyshev(role.pos, station.pos) <= 1:
+                commands[role.unit_id] = use_command(voucher, station.pos)
+                return True
+
+    # 使用围墙升级券
+    for voucher, level_check in [
+        ("WallUpgradeVoucher1", 1),
+        ("WallUpgradeVoucher2", 2),
+    ]:
+        if voucher not in bp:
+            continue
+        for w in turn.walls():
+            if w.level == level_check and chebyshev(role.pos, w.pos) <= 1:
+                commands[role.unit_id] = use_command(voucher, w.pos)
+                return True
+
+    # 使用围墙修复包
+    if "WallFixer" in bp:
+        low_walls = [w for w in turn.walls() if w.health < 800]
+        for w in low_walls:
+            if chebyshev(role.pos, w.pos) <= 1:
+                commands[role.unit_id] = use_command("WallFixer", w.pos)
+                return True
+
+    return False
 
 
 def _build_or_walk(turn, role, target, name, claimed, commands):

@@ -189,6 +189,29 @@ class Robot:
 
 
 @dataclass(frozen=True)
+class PlayerTask:
+    task_type: str
+    task_position: Pos
+    cold_down_rounds: int
+    score_reward: int
+    gold_reward: int
+    is_valid: bool
+    timeout_rounds: int
+
+    @classmethod
+    def load(cls, raw):
+        return cls(
+            str(raw.get("taskType", "")),
+            Pos.load(raw["taskPosition"]),
+            int(raw.get("coldDownRounds") or 0),
+            int(raw.get("scoreReward") or 0),
+            int(raw.get("goldReward") or 0),
+            bool(raw.get("isValid", False)),
+            int(raw.get("timeoutRounds") or 0),
+        )
+
+
+@dataclass(frozen=True)
 class Turn:
     round_no: int
     is_day: bool
@@ -205,6 +228,8 @@ class Turn:
     errors: list
     last_action_results: dict
     team_type: str
+    player_tasks: tuple
+    llm_resp: str
 
     @classmethod
     def load(cls, payload):
@@ -222,6 +247,11 @@ class Turn:
         last_action_results = {
             int(k): bool(v) for k, v in last_results_raw.items()
         }
+        player_tasks = tuple(
+            PlayerTask.load(pt)
+            for pt in (team.get("playerTasks") or [])
+        )
+        llm_resp = str(payload.get("llmResp") or "")
         return cls(
             round_no,
             (round_no - 1) % ROUNDS_PER_DAY < DAY_ROUNDS,
@@ -244,6 +274,8 @@ class Turn:
             errors,
             last_action_results,
             str(team.get("type") or ""),
+            player_tasks,
+            llm_resp,
         )
 
     @property
@@ -344,6 +376,23 @@ class Turn:
                 return pos
         return None
 
+    def valid_tasks(self):
+        return tuple(
+            pt for pt in self.player_tasks
+            if pt.is_valid and pt.cold_down_rounds == 0
+        )
+
+    @property
+    def folk_legends(self):
+        return str(self.world_news.get("folkLegends", ""))
+
+    @property
+    def official_news(self):
+        return str(self.world_news.get("officialNews", ""))
+
+    def has_active_task(self):
+        return bool(self.phase_task)
+
 
 def move_command(pos):
     return {"action": "move", "targetPos": [pos.dump()]}
@@ -386,3 +435,19 @@ def use_command(name, target=None):
 
 def drop_command(name):
     return {"action": "drop", "name": name}
+
+
+def accept_task_command():
+    return {"action": "acceptTask"}
+
+
+def submit_answer_command(answer):
+    return {"action": "submitAnswer", "taskAnswer": str(answer)}
+
+
+def summon_treasure_command(target_pos, items):
+    return {
+        "action": "summonTreasure",
+        "targetPos": [target_pos.dump()],
+        "item": list(items),
+    }
