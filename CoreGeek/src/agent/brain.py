@@ -275,6 +275,20 @@ def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
             if role.unit_id not in commands:
                 commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
+    # ── 提前回防：夜晚来临前5回合，工人走向武器 ──
+    if turn.round_in_day >= 65:
+        weapons = turn.weapons()
+        for role in turn.controllable():
+            if role.unit_id in commands:
+                continue  # 已有指令，跳过
+            if not weapons:
+                continue
+            nearest = min(weapons, key=lambda w: chebyshev(role.pos, w.pos))
+            if chebyshev(role.pos, nearest.pos) > 1:
+                step = _step_toward(turn, role, nearest.pos, claimed)
+                if step is not None:
+                    commands[role.unit_id] = move_command(step)
+
 
 # ── 建造失败追踪（避免同一位置反复失败） ──
 _build_failures: dict[tuple, int] = {}
@@ -294,6 +308,7 @@ def _worker_build_tower(turn, role, sites, free_towers, claimed, commands):
 
 
 def _worker_miner(turn, role, free_towers, free_walls, claimed, commands):
+    """工人1：优先采高价值矿（铁/铜），兼顾建塔"""
     if free_towers and turn.gold >= WEAPON_BUILD_COST:
         for idx, site in enumerate(_tower_sites(turn)):
             if site in free_towers and site not in claimed:
@@ -303,54 +318,48 @@ def _worker_miner(turn, role, free_towers, free_walls, claimed, commands):
     if role.backpack_almost_full:
         _go_sell(turn, role, claimed, commands)
         return
-    stones = role.backpack.count(WALL_MATERIAL)
-    if stones < STONE_BATCH:
-        _mine_stone(turn, role, claimed, commands)
-        return
 
-    # 根据官方新闻调整采矿优先级
-    ore_bonuses = _analyze_ore_news(turn)
     iron = role.backpack.count("iron")
     copper = role.backpack.count("copper")
+    stones = role.backpack.count(WALL_MATERIAL)
 
-    # 铁有涨价新闻 → 优先采铁
-    if ore_bonuses.get("iron", 0) > 0 and iron < 10:
+    # 优先采铁铜（高价值），而不是只采石头
+    if iron < 8:
         _mine_ore(turn, role, "iron", claimed, commands)
         return
-    # 铜有涨价新闻 → 优先采铜
-    if ore_bonuses.get("copper", 0) > 0 and copper < 10:
+    if copper < 8:
         _mine_ore(turn, role, "copper", claimed, commands)
         return
-
-    # 默认优先级
-    if iron < 5:
-        _mine_ore(turn, role, "iron", claimed, commands)
-        return
-    if copper < 5:
-        _mine_ore(turn, role, "copper", claimed, commands)
+    # 铁铜够了，补充石头用于建墙
+    if stones < STONE_BATCH:
+        _mine_stone(turn, role, claimed, commands)
         return
     _mine_stone(turn, role, claimed, commands)
 
 
 def _worker_flex(turn, role, free_walls, claimed, commands):
+    """工人2：采石头 → 建围墙 → 卖矿 → 买升级"""
     if role.backpack:
         _go_sell(turn, role, claimed, commands)
         return
     # 白天使用升级券
     if _try_use_upgrade_vouchers(turn, role, commands):
         return
-    # 购买机器人召唤令（骚扰敌方）
-    if _try_buy_summon_orders(turn, role, commands):
-        return
-    if turn.gold >= 100 and turn.day_number >= 3:
-        _go_buy_upgrade(turn, role, claimed, commands)
-        return
+    # 有石头就建墙（优先于买东西）
     stones = role.backpack.count(WALL_MATERIAL)
     if stones > 0 and free_walls:
         for site in free_walls:
             if site not in claimed:
                 _build_or_walk(turn, role, site, WALL, claimed, commands)
                 return
+    # 购买机器人召唤令（骚扰敌方）
+    if _try_buy_summon_orders(turn, role, commands):
+        return
+    # 金币够就买升级用品
+    if turn.gold >= 100 and turn.day_number >= 3:
+        _go_buy_upgrade(turn, role, claimed, commands)
+        return
+    # 兜底：采石头
     _mine_stone(turn, role, claimed, commands)
 
 
