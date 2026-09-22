@@ -139,6 +139,18 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     # 自动重试（独立 try，失败不影响主逻辑）
     try:
         _auto_retry(turn, commands)
+        # 追踪建造失败：上回合角色动作失败 → 记录失败位置
+        for uid, ok in turn.last_action_results.items():
+            if not ok:
+                for u in turn.ours:
+                    if u.unit_id == uid and u.kind == WORKER:
+                        # 工人失败，可能是建造失败 → 查找该工人附近的塔位
+                        for site in _tower_sites(turn):
+                            if chebyshev(u.pos, site) <= 1:
+                                key = (site.x, site.y)
+                                _build_failures[key] = _build_failures.get(key, 0) + 1
+                                LOGGER.info("build failure tracked at %s (count=%d)", site, _build_failures[key])
+                                break
     except Exception as e:
         LOGGER.exception("_auto_retry failed: %s", e)
 
@@ -264,9 +276,17 @@ def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
                 commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
 
+# ── 建造失败追踪（避免同一位置反复失败） ──
+_build_failures: dict[tuple, int] = {}
+MAX_BUILD_FAILURES = 3
+
+
 def _worker_build_tower(turn, role, sites, free_towers, claimed, commands):
     for idx, site in enumerate(sites):
         if site in free_towers and site not in claimed:
+            key = (site.x, site.y)
+            if _build_failures.get(key, 0) >= MAX_BUILD_FAILURES:
+                continue  # 该位置反复失败，跳过
             tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
             _build_or_walk(turn, role, site, tower_name, claimed, commands)
             return
@@ -612,8 +632,14 @@ def _night(turn, commands):
 
 
 def _best_unassigned_weapon(role, weapons, assigned_weapons):
-    """为角色选择最近的未分配武器"""
-    candidates = [w for w in weapons if w.unit_id not in assigned_weapons]
+    """为角色选择最近的未分配武器（跳过冷却中的武器）"""
+    candidates = [
+        w for w in weapons
+        if w.unit_id not in assigned_weapons and w.cooldown <= 0
+    ]
+    if not candidates:
+        # 所有武器都在冷却 → 选最近的（走过去等冷却结束）
+        candidates = [w for w in weapons if w.unit_id not in assigned_weapons]
     if not candidates:
         return None
     return min(candidates, key=lambda w: chebyshev(role.pos, w.pos))
