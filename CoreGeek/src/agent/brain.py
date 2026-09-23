@@ -447,14 +447,14 @@ def _pioneer_go_task(turn, role, valid_tasks, claimed, commands):
 
 
 def _pioneer_idle(turn, role, claimed, commands):
-    """开拓者空闲时：购买任务用品 + 宝藏召唤 + 巡逻"""
+    """开拓者空闲时：宝藏召唤 + 买任务用品 + 提前就位任务点 + 帮忙采石"""
     # 0. 优先尝试宝藏召唤
     if _try_summon_treasure(turn, role, claimed, commands):
         return
 
     shop = turn.weapon_shop_pos()
 
-    # 1. 如果背包有空位且有金币，去购买任务用品
+    # 1. 购买任务用品（为下次召唤宝藏准备）
     task_items = [
         "AcientTablet", "StarSand", "FlameBreath",
         "FrostPotion", "ThornAmulet", "IronWhistle",
@@ -471,17 +471,21 @@ def _pioneer_idle(turn, role, claimed, commands):
                 commands[role.unit_id] = move_command(step)
                 return
 
-    # 2. 没有东西买时，往任务点方向巡逻
-    valid_tasks = turn.valid_tasks()
-    if valid_tasks:
-        best = max(valid_tasks, key=lambda t: t.score_reward)
-        if chebyshev(role.pos, best.task_position) > 5:
-            step = _step_toward(turn, role, best.task_position, claimed)
+    # 2. 冷却期间也往最近的任务点走（提前就位）
+    all_tasks = turn.player_tasks
+    if all_tasks:
+        # 选最近的任务点（即使还在冷却）
+        nearest_task = min(all_tasks, key=lambda t: chebyshev(role.pos, t.task_position))
+        if chebyshev(role.pos, nearest_task.task_position) > 1:
+            step = _step_toward(turn, role, nearest_task.task_position, claimed)
             if step is not None:
                 commands[role.unit_id] = move_command(step)
                 return
+        # 已到任务点旁，但还在冷却 → 帮忙采石头
+        _mine_stone(turn, role, claimed, commands)
+        return
 
-    # 3. 完全空闲，往基地方向靠拢
+    # 3. 完全没有任务点，往基地方向靠拢
     station = turn.station()
     if station and chebyshev(role.pos, station.pos) > 6:
         step = _step_toward(turn, role, station.pos, claimed)
