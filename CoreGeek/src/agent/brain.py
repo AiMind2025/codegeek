@@ -337,16 +337,22 @@ def _worker_build_tower(turn, role, sites, free_towers, claimed, commands):
 
 
 def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
-    """工人1：采石头 + 建围墙 + 建炮台"""
-    # 优先建炮台
+    """工人1：专挖石头 + 建围墙 + 建炮台（前2回合优先挖2个石头）"""
+    # 建炮台优先
     if free_towers and turn.gold >= WEAPON_BUILD_COST:
         for idx, site in enumerate(_tower_sites(turn)):
             if site in free_towers and site not in claimed:
                 tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
                 _build_or_walk(turn, role, site, tower_name, claimed, commands)
                 return
-    # 有石头就建墙
+    # 前2天且石头不够 → 先挖够石头再建墙
     stones = role.backpack.count(WALL_MATERIAL)
+    day = turn.day_number
+    round_in_day = turn.round_in_day
+    if day <= 2 and round_in_day <= 10 and stones < 2:
+        _mine_stone(turn, role, claimed, commands)
+        return
+    # 有石头就建墙
     if stones > 0 and free_walls:
         for site in free_walls:
             if site not in claimed:
@@ -356,34 +362,34 @@ def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
     if role.backpack_almost_full:
         _go_sell(turn, role, claimed, commands)
         return
-    # 兜底：采石头
+    # 兜底：持续挖石头
     _mine_stone(turn, role, claimed, commands)
 
 
 def _worker_miner_seller(turn, role, free_towers, claimed, commands):
-    """工人2：采铜/铁矿 → 背包满50%去卖 → 回来继续采（循环）"""
-    # 优先建炮台（如果有空缺）
+    """工人2：专挖铜/铁 → 背包满50%去卖 → 回来继续采（持续循环）"""
+    # 建炮台优先
     if free_towers and turn.gold >= WEAPON_BUILD_COST:
         for idx, site in enumerate(_tower_sites(turn)):
             if site in free_towers and site not in claimed:
                 tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
                 _build_or_walk(turn, role, site, tower_name, claimed, commands)
                 return
-    # 背包≥50%才去卖（避免跑太远）
+    # 背包≥50%才去卖
     if role.backpack_almost_full:
         _go_sell(turn, role, claimed, commands)
         return
-    # 采铜（价值最高）
+    # 专挖铜（价值最高）
     copper = role.backpack.count("copper")
-    if copper < 10:
+    if copper < 15:
         _mine_ore(turn, role, "copper", claimed, commands)
         return
-    # 采铁
+    # 再挖铁
     iron = role.backpack.count("iron")
-    if iron < 10:
+    if iron < 15:
         _mine_ore(turn, role, "iron", claimed, commands)
         return
-    # 铜铁都够了，采石头
+    # 铜铁够了挖石头
     _mine_stone(turn, role, claimed, commands)
 
 
@@ -687,7 +693,7 @@ def _process_treasure_llm_result(turn, role, claimed, commands):
 
 
 def _night(turn, commands):
-    claimed: set[Pos] = set()
+    """夜晚：一人一武器固定分配，不走动，只攻击"""
     enemy_robots = tuple(
         r for r in turn.robots
         if r.target_team == turn.team_type and not r.is_dizzy
@@ -695,53 +701,33 @@ def _night(turn, commands):
     weapons = turn.weapons()
     controllable = turn.controllable()
 
-    # ── 角色物品使用（夜晚优先保命） ──
+    # 物品使用（保命优先）
     for role in controllable:
         _role_use_items_night(turn, role, enemy_robots, commands)
 
-    # ── 优先工人配对武器 ─
+    # 固定分配：工人1→武器0, 工人2→武器1, 开拓者→武器2
     workers = turn.workers()
     pioneer = _find_pioneer(turn)
-    assigned_roles: set[int] = set()
-    assigned_weapons: set[int] = set()
+    role_list = list(workers)
+    if pioneer is not None:
+        role_list.append(pioneer)
 
-    for worker in workers:
-        if worker.unit_id in assigned_roles:
+    for i, role in enumerate(role_list):
+        if role.unit_id in commands:
+            continue  # 已用物品，跳过
+        if i >= len(weapons):
+            continue  # 武器不够，该角色闲置
+        weapon = weapons[i]
+        # 不在武器旁 → 夜晚不走动，跳过
+        if chebyshev(role.pos, weapon.pos) > 1:
             continue
-        weapon = _best_unassigned_weapon(worker, weapons, assigned_weapons)
-        if weapon is None:
+        # 冷却中 → 不攻击
+        if weapon.cooldown > 0:
             continue
-        _operate_or_approach(turn, worker, weapon, enemy_robots, claimed, commands)
-        assigned_roles.add(worker.unit_id)
-        assigned_weapons.add(weapon.unit_id)
-
-    # ── 开拓者配对剩余武器 ──
-    if pioneer is not None and pioneer.unit_id not in assigned_roles:
-        weapon = _best_unassigned_weapon(pioneer, weapons, assigned_weapons)
-        if weapon is not None:
-            _operate_or_approach(turn, pioneer, weapon, enemy_robots, claimed, commands)
-            assigned_roles.add(pioneer.unit_id)
-            assigned_weapons.add(weapon.unit_id)
-        else:
-            _pioneer_night(turn, pioneer, claimed, commands)
-
-    # ── 未配对角色前往最近武器 ──
-    for role in controllable:
-        if role.unit_id in assigned_roles:
-            continue
-        if not weapons:
-            continue
-        nearest = min(weapons, key=lambda t: chebyshev(role.pos, t.pos))
-        if chebyshev(role.pos, nearest.pos) <= 1:
-            continue
-        step = _step_toward(turn, role, nearest.pos, claimed)
-        if step is not None:
-            commands[role.unit_id] = move_command(step)
-
-    #  安全网：无命令时发原地待命 ──
-    if not commands:
-        for role in controllable:
-            commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
+        # 选择目标攻击
+        targets = _select_attack_targets(weapon, enemy_robots, turn)
+        if targets:
+            commands[weapon.unit_id] = attack_command(role.unit_id, targets)
 
 
 def _best_unassigned_weapon(role, weapons, assigned_weapons):
@@ -938,7 +924,6 @@ def _go_sell(turn, role, claimed, commands):
         return
     if chebyshev(role.pos, vendor) <= 1:
         prices = turn.vendor_prices
-        # 官方新闻加成：涨价矿石优先卖
         bonuses = _analyze_ore_news(turn)
         items = sorted(
             set(role.backpack),
@@ -949,6 +934,8 @@ def _go_sell(turn, role, claimed, commands):
             for item in items:
                 count = role.backpack.count(item)
                 if count > 0:
+                    revenue = count * prices.get(item, 0)
+                    LOGGER.info("SELL role=%d %s x%d → +%d gold", role.unit_id, item, count, revenue)
                     commands[role.unit_id] = sell_command(item, count)
                     return
     else:
@@ -978,11 +965,13 @@ def _buy_priority(turn, role, commands):
         return
     gold = turn.gold
     weapons = turn.weapons()
-    for w in weapons:
+    # 找等级最低的武器升级
+    for w in sorted(weapons, key=lambda x: x.level):
         if w.level < 3:
             voucher = "WeaponUpgradeVoucher1" if w.level == 1 else "WeaponUpgradeVoucher2"
             price = 100 if w.level == 1 else 150
             if gold >= price and voucher not in role.backpack:
+                LOGGER.info("BUY role=%d %s → upgrade weapon at %s (lv%d→lv%d)", role.unit_id, voucher, w.pos, w.level, w.level + 1)
                 commands[role.unit_id] = buy_command(voucher, 1)
                 return
     station = turn.station()
@@ -990,22 +979,27 @@ def _buy_priority(turn, role, commands):
         voucher = "StationUpgradeVoucher1" if station.level == 1 else "StationUpgradeVoucher2"
         price = 100 if station.level == 1 else 150
         if gold >= price and voucher not in role.backpack:
+            LOGGER.info("BUY role=%d %s → upgrade station", role.unit_id, voucher)
             commands[role.unit_id] = buy_command(voucher, 1)
             return
     if not turn.is_day and turn.rounds_remaining_today > 50:
         if gold >= 100 and "DizzyWeapon" not in role.backpack:
+            LOGGER.info("BUY role=%d DizzyWeapon", role.unit_id)
             commands[role.unit_id] = buy_command("DizzyWeapon", 1)
             return
         if gold >= 100 and "Bomb" not in role.backpack:
+            LOGGER.info("BUY role=%d Bomb", role.unit_id)
             commands[role.unit_id] = buy_command("Bomb", 1)
             return
     walls = turn.walls()
     low_walls = [w for w in walls if w.health < 800]
     if low_walls and gold >= 10 and "WallFixer" not in role.backpack:
+        LOGGER.info("BUY role=%d WallFixer x%d", role.unit_id, min(len(low_walls), gold // 10))
         commands[role.unit_id] = buy_command("WallFixer", min(len(low_walls), gold // 10))
         return
     low_hp_roles = [u for u in turn.ours if u.kind in (WORKER, PIONEER) and u.health < 110]
     if low_hp_roles and gold >= 10 and "Medicine" not in role.backpack:
+        LOGGER.info("BUY role=%d Medicine", role.unit_id)
         commands[role.unit_id] = buy_command("Medicine", 1)
         return
 
@@ -1089,17 +1083,35 @@ def _step_toward(turn, role, target, claimed):
 
 
 def _tower_sites(turn):
+    """3座武器分散摆放，朝向敌人方向（地图中心侧）"""
     station = turn.station()
     if station is None:
         return []
-    footprint = station_footprint(station.pos)
-    cells = [pos for pos in _cells_at_distance(station.pos, 1) if turn.land(pos)]
-    cells.sort(key=lambda pos: (_footprint_distance(pos, footprint), pos.x, pos.y))
-    return cells[:3]
+    sp = station.pos
+    edge = turn.map_edge_side
+    if edge == "left":
+        # 基地左侧靠边 → 武器往右、右上、右下分散
+        candidates = [
+            Pos(sp.x + 2, sp.y),      # 右
+            Pos(sp.x + 2, sp.y + 1),  # 右上
+            Pos(sp.x + 2, sp.y - 1),  # 右下
+            Pos(sp.x + 1, sp.y + 2),  # 上
+            Pos(sp.x + 1, sp.y - 2),  # 下
+        ]
+    else:
+        # 基地右侧靠边 → 武器往左、左上、左下分散
+        candidates = [
+            Pos(sp.x - 1, sp.y),      # 左
+            Pos(sp.x - 1, sp.y + 1),  # 左上
+            Pos(sp.x - 1, sp.y - 1),  # 左下
+            Pos(sp.x - 2, sp.y + 2),  # 上
+            Pos(sp.x - 2, sp.y - 2),  # 下
+        ]
+    return [pos for pos in candidates if turn.land(pos)][:3]
 
 
 def _wall_order(turn):
-    """围墙双环闭环：左侧优先，Ring1+Ring2对齐入口形成走廊"""
+    """围墙三方位闭环：跳过靠地图边缘那侧，入口朝敌人方向"""
     station = turn.station()
     if station is None:
         return []
@@ -1108,32 +1120,28 @@ def _wall_order(turn):
     ys = [pos.y for pos in footprint]
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
-    # Ring1 入口（右下角）
-    r1_entrance = Pos(xmax + 1, ymin - 1)
-    # Ring2 入口（与 Ring1 入口对角对齐，形成走廊）
-    r2_entrance = Pos(xmax + 2, ymin - 2)
-    order = [
-        # === Ring 1：紧贴基地 ===
-        # 左墙（ymax→ymin-1）：最优先，机器人主攻方向
-        *(Pos(xmin - 1, y) for y in range(ymax, ymin - 2, -1)),
-        # 顶墙（xmin-1→xmax+1）
-        *(Pos(x, ymax + 1) for x in range(xmin - 1, xmax + 2)),
-        # 右墙（ymax→ymin）
-        *(Pos(xmax + 1, y) for y in range(ymax, ymin - 1, -1)),
-        # 底墙（xmax→xmin-1），跳过入口
-        *(Pos(x, ymin - 1) for x in range(xmax, xmin - 2, -1)),
-        # === Ring 2：外层加固 ===
-        # 左墙
-        *(Pos(xmin - 2, y) for y in range(ymax + 1, ymin - 3, -1)),
-        # 顶墙
-        *(Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)),
-        # 右墙
-        *(Pos(xmax + 2, y) for y in range(ymax + 1, ymin - 3, -1)),
-        # 底墙，跳过入口
-        *(Pos(x, ymin - 2) for x in range(xmax + 1, xmin - 3, -1)),
-    ]
-    blocked_pos = {r1_entrance, r2_entrance}
-    return [pos for pos in order if pos not in blocked_pos and turn.land(pos)]
+    edge = turn.map_edge_side  # "left" 或 "right"
+    # 入口位置：靠敌人方向（与边缘相反）
+    if edge == "left":
+        entrance = Pos(xmax + 1, ymin - 1)  # 右下入口
+    else:
+        entrance = Pos(xmin - 1, ymin - 1)  # 左下入口
+    order = []
+    # 顶墙（始终需要）
+    order += [Pos(x, ymax + 1) for x in range(xmin - 1, xmax + 2)]
+    # 底墙（始终需要，跳过入口）
+    order += [Pos(x, ymin - 1) for x in range(xmin - 1, xmax + 2) if Pos(x, ymin - 1) != entrance]
+    if edge == "left":
+        # 右墙（远离边缘侧，优先）
+        order += [Pos(xmax + 1, y) for y in range(ymax, ymin - 1, -1)]
+        # 左墙靠地图边缘，放最后
+        order += [Pos(xmin - 1, y) for y in range(ymax, ymin - 1, -1)]
+    else:
+        # 左墙（远离边缘侧，优先）
+        order += [Pos(xmin - 1, y) for y in range(ymax, ymin - 1, -1)]
+        # 右墙靠地图边缘，放最后
+        order += [Pos(xmax + 1, y) for y in range(ymax, ymin - 1, -1)]
+    return [pos for pos in order if pos != entrance and turn.land(pos)]
 
 
 def _cells_at_distance(station_pos, radius):

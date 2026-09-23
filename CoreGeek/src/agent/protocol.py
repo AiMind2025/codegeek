@@ -398,6 +398,42 @@ class Turn:
     def has_active_task(self):
         return bool(self.phase_task)
 
+    # ── 基地方位检测 ──
+    @property
+    def base_corner(self):
+        """检测基地在左上还是右下"""
+        station = self.station()
+        if station is None:
+            return "top_left"  # 默认
+        # 地图中心 (20, 16)
+        if station.pos.x < self.width // 2:
+            return "top_left"  # 基地在左侧
+        return "bottom_right"  # 基地在右侧
+
+    @property
+    def map_edge_side(self):
+        """地图边缘方向（不需要建墙的那侧）"""
+        corner = self.base_corner
+        if corner == "top_left":
+            return "left"  # 左侧靠地图边缘
+        return "right"  # 右侧靠地图边缘
+
+    @property
+    def wall_build_sides(self):
+        """需要建墙的3个方向"""
+        edge = self.map_edge_side
+        if edge == "left":
+            return ("top", "right", "bottom")  # 不建左侧
+        return ("top", "left", "bottom")  # 不建右侧
+
+    @property
+    def weapon_direction(self):
+        """武器应该放置的方向（朝向地图中心/敌人方向）"""
+        corner = self.base_corner
+        if corner == "top_left":
+            return "right"  # 武器往右放
+        return "left"  # 武器往左放
+
 
 def move_command(pos):
     return {"action": "move", "targetPos": [pos.dump()]}
