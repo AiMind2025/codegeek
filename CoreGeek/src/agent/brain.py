@@ -251,7 +251,21 @@ def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
     day = turn.day_number
 
     # 每个工人独立 try，一个失败不影响另一个
-    if day <= 2:
+    station = turn.station()
+    base_hp = station.health if station else 1500
+
+    # 基地紧急模式：HP<500 时所有工人停止采矿，全力建墙
+    if base_hp < 500 and free_walls:
+        for w in workers:
+            try:
+                for site in free_walls:
+                    if site not in claimed:
+                        _build_or_walk(turn, w, site, WALL, claimed, commands)
+                        break
+            except Exception as e:
+                LOGGER.exception("emergency wall build failed (id=%s): %s", w.unit_id, e)
+        # 紧急模式下跳过正常工人逻辑
+    elif day <= 2:
         # 前两天：工人1建炮台，工人2采石头备料
         if len(workers) >= 1:
             try:
@@ -347,7 +361,7 @@ def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
 
 
 def _worker_miner_seller(turn, role, free_towers, claimed, commands):
-    """工人2：采铜/铁矿 + 售卖赚钱"""
+    """工人2：采铜/铁矿 → 背包满50%去卖 → 回来继续采（循环）"""
     # 优先建炮台（如果有空缺）
     if free_towers and turn.gold >= WEAPON_BUILD_COST:
         for idx, site in enumerate(_tower_sites(turn)):
@@ -355,8 +369,8 @@ def _worker_miner_seller(turn, role, free_towers, claimed, commands):
                 tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
                 _build_or_walk(turn, role, site, tower_name, claimed, commands)
                 return
-    # 背包有矿就去卖
-    if role.backpack:
+    # 背包≥50%才去卖（避免跑太远）
+    if role.backpack_almost_full:
         _go_sell(turn, role, claimed, commands)
         return
     # 采铜（价值最高）
@@ -811,12 +825,14 @@ def _select_attack_targets(tower, robots, turn):
     reach = tower.range_of_attack()
     base = turn.station()
     base_pos = base.pos if base else Pos(20, 16)
+    # 只攻击存活且在射程内的敌人
     in_range = [
         r for r in robots
         if r.health > 0 and chebyshev(tower.pos, r.pos) <= reach
     ]
     if not in_range:
         return []
+    # 优先打：威胁大的 → 离基地近的 → 血量低的
     in_range.sort(key=lambda r: (-r.threat_score, chebyshev(r.pos, base_pos), r.health))
     if tower.kind == "railgun":
         return [_best_railgun_target(tower, in_range)]
@@ -1083,7 +1099,7 @@ def _tower_sites(turn):
 
 
 def _wall_order(turn):
-    """围墙建造顺序：左侧优先（机器人主要攻击方向），扩展到距离2覆盖更大范围"""
+    """围墙双环闭环：左侧优先，Ring1+Ring2对齐入口形成走廊"""
     station = turn.station()
     if station is None:
         return []
@@ -1092,21 +1108,32 @@ def _wall_order(turn):
     ys = [pos.y for pos in footprint]
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
-    # 优先左侧（xmin方向），然后上、右、下；扩展到距离2
+    # Ring1 入口（右下角）
+    r1_entrance = Pos(xmax + 1, ymin - 1)
+    # Ring2 入口（与 Ring1 入口对角对齐，形成走廊）
+    r2_entrance = Pos(xmax + 2, ymin - 2)
     order = [
-        # 第1圈：左侧 → 上侧 → 右侧 → 下侧（入口除外）
-        *(Pos(xmin - 1, y) for y in range(ymax + 1, ymin - 2, -1)),
+        # === Ring 1：紧贴基地 ===
+        # 左墙（ymax→ymin-1）：最优先，机器人主攻方向
+        *(Pos(xmin - 1, y) for y in range(ymax, ymin - 2, -1)),
+        # 顶墙（xmin-1→xmax+1）
         *(Pos(x, ymax + 1) for x in range(xmin - 1, xmax + 2)),
-        *(Pos(xmax + 1, y) for y in range(ymin - 1, ymax + 2)),
-        *(Pos(x, ymin - 1) for x in range(xmax + 1, xmin - 2, -1)),
-        # 第2圈：更外层，同样左侧优先
-        *(Pos(xmin - 2, y) for y in range(ymax + 2, ymin - 3, -1)),
+        # 右墙（ymax→ymin）
+        *(Pos(xmax + 1, y) for y in range(ymax, ymin - 1, -1)),
+        # 底墙（xmax→xmin-1），跳过入口
+        *(Pos(x, ymin - 1) for x in range(xmax, xmin - 2, -1)),
+        # === Ring 2：外层加固 ===
+        # 左墙
+        *(Pos(xmin - 2, y) for y in range(ymax + 1, ymin - 3, -1)),
+        # 顶墙
         *(Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)),
-        *(Pos(xmax + 2, y) for y in range(ymin - 2, ymax + 3)),
-        *(Pos(x, ymin - 2) for x in range(xmax + 2, xmin - 3, -1)),
+        # 右墙
+        *(Pos(xmax + 2, y) for y in range(ymax + 1, ymin - 3, -1)),
+        # 底墙，跳过入口
+        *(Pos(x, ymin - 2) for x in range(xmax + 1, xmin - 3, -1)),
     ]
-    entrance = Pos(xmax + 2, ymin - 1)
-    return [pos for pos in order if pos != entrance and turn.land(pos)]
+    blocked_pos = {r1_entrance, r2_entrance}
+    return [pos for pos in order if pos not in blocked_pos and turn.land(pos)]
 
 
 def _cells_at_distance(station_pos, radius):
