@@ -618,9 +618,16 @@ _ALL_TASK_ITEMS = (
     "FrostPotion", "ThornAmulet", "IronWhistle",
 )
 
+# 长上下文任务最早出现天数（attackmap=第8天, attackmap_update=第5天）
+# 用5作为下限，避免前几天浪费 LLM 配额
+_MIN_TREASURE_DAY = 5
+
 
 def _try_summon_treasure(turn, role, claimed, commands):
     """尝试召唤宝藏：用累计传闻解析 → 定位祭坛 → 带齐物品 → 召唤"""
+    # 长上下文任务最早第5天才出现，之前不浪费 LLM 配额
+    if turn.day_number < _MIN_TREASURE_DAY:
+        return False
     legends = get_all_folklore()
     if not legends:
         return False
