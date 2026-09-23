@@ -1294,9 +1294,9 @@ def _night(turn, commands):
             if step:
                 commands[role.unit_id] = move_command(step)
 
-    # 安全网：夜晚无命令时原地待命
-    if not commands:
-        for role in controllable:
+    # 安全网：确保每个可控角色都有命令
+    for role in controllable:
+        if role.unit_id not in commands:
             commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
 
