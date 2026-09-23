@@ -4,7 +4,7 @@
 import logging
 from typing import Any
 
-from .grid import next_step
+from .grid import next_step, path_length
 from .lore import append_folklore, get_all_folklore
 from .protocol import (
     PIONEER,
@@ -42,6 +42,8 @@ def _log_decision(role_id, action, detail=""):
 
 TOWER_LOADOUT = ("gatling", "railgun", "rocket")
 STONE_BATCH = 10
+DEFEND_ARRIVE_ROUND = 68
+DEFEND_BUFFER_ROUNDS = 2
 _NEIGHBOUR_STEPS = (
     (-1, -1), (-1, 0), (-1, 1),
     (0, -1),           (0, 1),
@@ -308,19 +310,12 @@ def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
         if role.unit_id not in commands:
             commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
-    # ── 提前回防：夜晚来临前5回合，工人走向武器 ──
-    if turn.round_in_day >= 65:
-        weapons = turn.weapons()
-        for role in turn.controllable():
-            if role.unit_id in commands:
-                continue  # 已有指令，跳过
-            if not weapons:
-                continue
-            nearest = min(weapons, key=lambda w: chebyshev(role.pos, w.pos))
-            if chebyshev(role.pos, nearest.pos) > 1:
-                step = _step_toward(turn, role, nearest.pos, claimed)
-                if step is not None:
-                    commands[role.unit_id] = move_command(step)
+    # ── 动态回防：每人计算自己的deadline ──
+    for role in turn.controllable():
+        if role.unit_id in commands:
+            continue
+        if _is_defend_time(turn, role):
+            _return_to_defend(turn, role, claimed, commands)
 
 
 # ── 建造失败追踪（避免同一位置反复失败） ──
@@ -341,61 +336,169 @@ def _worker_build_tower(turn, role, sites, free_towers, claimed, commands):
     _mine_stone(turn, role, claimed, commands)
 
 
+def _mine_while_adjacent(turn, role, claimed, commands, ore_types, min_count=2):
+    """持续采集：在矿点旁时连续采集，直到背包满/矿完/到回防时间"""
+    if _is_defend_time(turn, role):
+        return False
+    if role.backpack_almost_full:
+        return False
+    if isinstance(ore_types, str):
+        ore_types = (ore_types,)
+    for ore in ore_types:
+        mines_map = {"stone": turn.stone_mines(), "iron": turn.iron_mines(), "copper": turn.copper_mines()}
+        mines = mines_map.get(ore, ())
+        for mine in mines:
+            if mine in claimed:
+                continue
+            if chebyshev(role.pos, mine) <= 1:
+                commands[role.unit_id] = collect_command(mine)
+                claimed.add(mine)
+                return True
+    return False
+
+
+def _is_defend_time(turn, role):
+    """判断是否该回防了"""
+    target = _defend_target(turn, role)
+    if target is None:
+        return False
+    dist = path_length(turn, role, target)
+    if dist is None:
+        dist = chebyshev(role.pos, target)
+    deadline = DEFEND_ARRIVE_ROUND - dist - DEFEND_BUFFER_ROUNDS
+    return turn.round_in_day >= deadline
+
+
+def _defend_target(turn, role):
+    """回防目标：固定分配的武器位置，无武器则回基地"""
+    weapons = turn.weapons()
+    controllable = turn.controllable()
+    idx = None
+    for i, r in enumerate(controllable):
+        if r.unit_id == role.unit_id:
+            idx = i
+            break
+    if idx is not None and idx < len(weapons):
+        return weapons[idx].pos
+    station = turn.station()
+    return station.pos if station else None
+
+
+def _upgrade_weapon_flow(turn, role, commands):
+    """武器升级流程：有券用券，没券买券"""
+    weapons = turn.weapons()
+    if not weapons:
+        return False
+    # 找最低级武器
+    lowest = min(weapons, key=lambda w: w.level)
+    if lowest.level >= 3:
+        return False  # 全部顶级
+    voucher = "WeaponUpgradeVoucher1" if lowest.level == 1 else "WeaponUpgradeVoucher2"
+    price = 100 if lowest.level == 1 else 150
+    # 背包有券 → 去使用
+    if voucher in role.backpack:
+        if chebyshev(role.pos, lowest.pos) <= 1:
+            commands[role.unit_id] = use_command(voucher, lowest.pos)
+            LOGGER.info("USE_VOUCHER role=%d %s on weapon at %s", role.unit_id, voucher, lowest.pos)
+            return True
+        step = _step_toward(turn, role, lowest.pos, set())
+        if step:
+            commands[role.unit_id] = move_command(step)
+            return True
+        return False
+    # 没券 → 买券
+    if turn.gold >= price:
+        shop = turn.weapon_shop_pos()
+        if shop:
+            if chebyshev(role.pos, shop) <= 1:
+                commands[role.unit_id] = buy_command(voucher, 1)
+                LOGGER.info("BUY_VOUCHER role=%d %s for weapon lv%d", role.unit_id, voucher, lowest.level)
+                return True
+            step = _step_toward(turn, role, shop, set())
+            if step:
+                commands[role.unit_id] = move_command(step)
+                return True
+    return False
+
+
 def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
-    """工人1：专挖石头 + 建围墙 + 建炮台（前2回合优先挖2个石头）"""
-    # 建炮台优先
-    if free_towers and turn.gold >= WEAPON_BUILD_COST:
-        for idx, site in enumerate(_tower_sites(turn)):
-            if site in free_towers and site not in claimed:
-                tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
-                if _build_or_walk(turn, role, site, tower_name, claimed, commands):
-                    return
-    # 前2天且石头不够 → 先挖够石头再建墙
-    stones = role.backpack.count(WALL_MATERIAL)
-    day = turn.day_number
-    round_in_day = turn.round_in_day
-    if day <= 2 and round_in_day <= 10 and stones < 2:
-        _mine_stone(turn, role, claimed, commands)
+    """工人1：挖石头(2个) → 建围墙 → 建炮台"""
+    # 回防优先
+    if _is_defend_time(turn, role):
+        _return_to_defend(turn, role, claimed, commands)
         return
-    # 有石头就建墙
+    # 建炮台
+    if free_towers and turn.gold >= WEAPON_BUILD_COST:
+        for site in _tower_sites(turn):
+            if site in free_towers and site not in claimed:
+                idx = _tower_sites(turn).index(site)
+                if _build_or_walk(turn, role, site, TOWER_LOADOUT[idx % 3], claimed, commands):
+                    return
+    # 持续挖石头
+    if _mine_while_adjacent(turn, role, claimed, commands, "stone", 2):
+        return
+    stones = role.backpack.count(WALL_MATERIAL)
+    # 建围墙
     if stones > 0 and free_walls:
         for site in free_walls:
             if site not in claimed:
                 if _build_or_walk(turn, role, site, WALL, claimed, commands):
                     return
-    # 背包满就去卖
+    # 卖石头
     if role.backpack_almost_full:
         _go_sell(turn, role, claimed, commands)
         return
-    # 兜底：持续挖石头
+    # 挖石头
     _mine_stone(turn, role, claimed, commands)
 
 
 def _worker_miner_seller(turn, role, free_towers, claimed, commands):
-    """工人2：专挖铜/铁 → 背包满50%去卖 → 回来继续采（持续循环）"""
-    # 建炮台优先
+    """工人2：开局建武器 → 挖铜铁(2个) → 卖矿 → 买升级券 → 循环"""
+    # 回防优先
+    if _is_defend_time(turn, role):
+        _return_to_defend(turn, role, claimed, commands)
+        return
+    # 开局建炮台
     if free_towers and turn.gold >= WEAPON_BUILD_COST:
-        for idx, site in enumerate(_tower_sites(turn)):
+        for site in _tower_sites(turn):
             if site in free_towers and site not in claimed:
-                tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
-                if _build_or_walk(turn, role, site, tower_name, claimed, commands):
+                idx = _tower_sites(turn).index(site)
+                if _build_or_walk(turn, role, site, TOWER_LOADOUT[idx % 3], claimed, commands):
                     return
-    # 背包≥50%才去卖
-    if role.backpack_almost_full:
+    # 武器升级流程
+    if _upgrade_weapon_flow(turn, role, commands):
+        return
+    # 持续挖铜/铁
+    if _mine_while_adjacent(turn, role, claimed, commands, ("copper", "iron"), 2):
+        return
+    # 卖矿
+    if role.backpack:
         _go_sell(turn, role, claimed, commands)
         return
-    # 专挖铜（价值最高）
+    # 采铜→铁→石头
     copper = role.backpack.count("copper")
-    if copper < 15:
+    if copper < 10:
         _mine_ore(turn, role, "copper", claimed, commands)
         return
-    # 再挖铁
     iron = role.backpack.count("iron")
-    if iron < 15:
+    if iron < 10:
         _mine_ore(turn, role, "iron", claimed, commands)
         return
-    # 铜铁够了挖石头
     _mine_stone(turn, role, claimed, commands)
+
+
+def _return_to_defend(turn, role, claimed, commands):
+    """回防：走向分配的武器位置"""
+    target = _defend_target(turn, role)
+    if target is None:
+        return
+    if chebyshev(role.pos, target) <= 1:
+        return  # 已到位
+    step = _step_toward(turn, role, target, claimed)
+    if step:
+        commands[role.unit_id] = move_command(step)
+        LOGGER.info("RETURN_DEFEND role=%d %s->%s", role.unit_id, role.pos, target)
+
 
 
 def _pioneer_day(turn, role, claimed, commands):
@@ -845,19 +948,12 @@ def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
         if role.unit_id not in commands:
             commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
-    # ── 提前回防：夜晚来临前5回合，工人走向武器 ──
-    if turn.round_in_day >= 65:
-        weapons = turn.weapons()
-        for role in turn.controllable():
-            if role.unit_id in commands:
-                continue  # 已有指令，跳过
-            if not weapons:
-                continue
-            nearest = min(weapons, key=lambda w: chebyshev(role.pos, w.pos))
-            if chebyshev(role.pos, nearest.pos) > 1:
-                step = _step_toward(turn, role, nearest.pos, claimed)
-                if step is not None:
-                    commands[role.unit_id] = move_command(step)
+    # ── 动态回防：每人计算自己的deadline ──
+    for role in turn.controllable():
+        if role.unit_id in commands:
+            continue
+        if _is_defend_time(turn, role):
+            _return_to_defend(turn, role, claimed, commands)
 
 
 # ── 建造失败追踪（避免同一位置反复失败） ──
@@ -1662,31 +1758,42 @@ def _step_toward(turn, role, target, claimed):
 
 
 def _tower_sites(turn):
-    """3座武器分散摆放，朝向敌人方向（地图中心侧）"""
+    """3座武器间隔>=2分散摆放，朝向敌人方向"""
     station = turn.station()
     if station is None:
         return []
     sp = station.pos
     edge = turn.map_edge_side
-    if edge == "left":
-        # 基地左侧靠边 → 武器往右、右上、右下分散
-        candidates = [
-            Pos(sp.x + 2, sp.y),      # 右
-            Pos(sp.x + 2, sp.y + 1),  # 右上
-            Pos(sp.x + 2, sp.y - 1),  # 右下
-            Pos(sp.x + 1, sp.y + 2),  # 上
-            Pos(sp.x + 1, sp.y - 2),  # 下
-        ]
-    else:
-        # 基地右侧靠边 → 武器往左、左上、左下分散
-        candidates = [
-            Pos(sp.x - 1, sp.y),      # 左
-            Pos(sp.x - 1, sp.y + 1),  # 左上
-            Pos(sp.x - 1, sp.y - 1),  # 左下
-            Pos(sp.x - 2, sp.y + 2),  # 上
-            Pos(sp.x - 2, sp.y - 2),  # 下
-        ]
-    return [pos for pos in candidates if turn.land(pos)][:3]
+    # 敌人方向权重
+    sx = -1 if edge == "left" else 1  # 朝地图中心
+    sy = 0
+    # 候选位置（基地周围距离1~3）
+    candidates = []
+    for dist in range(1, 4):
+        for dx in range(-dist, dist + 1):
+            for dy in range(-dist, dist + 1):
+                if abs(dx) != dist and abs(dy) != dist:
+                    continue
+                pos = Pos(sp.x + dx, sp.y + dy)
+                if turn.land(pos) and pos not in turn.occupied_cells():
+                    weight = dx * sx + dy * sy
+                    candidates.append((weight, pos))
+    candidates.sort(key=lambda x: -x[0])
+    # 贪心选间隔>=2的3个
+    selected = []
+    for _, pos in candidates:
+        if all(chebyshev(pos, s) >= 2 for s in selected):
+            selected.append(pos)
+            if len(selected) == 3:
+                break
+    # 不够3个则放宽到间隔>=1
+    if len(selected) < 3:
+        for _, pos in candidates:
+            if pos not in selected:
+                selected.append(pos)
+                if len(selected) == 3:
+                    break
+    return selected
 
 
 def _wall_order(turn):

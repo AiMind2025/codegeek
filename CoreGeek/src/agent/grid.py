@@ -49,3 +49,37 @@ def _first_step(came_from, start, goal):
     while came_from[current] != start:
         current = came_from[current]
     return current
+
+
+def path_length(turn, moving, goal):
+    """A* 计算到目标的实际步数，不可达返回 None"""
+    if moving.pos == goal:
+        return 0
+    blocked = turn.blocked(moving)
+    order = count()
+    frontier = [
+        (chebyshev(moving.pos, goal), 0, next(order), moving.pos)
+    ]
+    best = {moving.pos: 0}
+    seen = set()
+
+    while frontier:
+        _, cost, _, current = heappop(frontier)
+        if current in seen:
+            continue
+        seen.add(current)
+        if current == goal:
+            return cost
+        for dx, dy in _STEPS:
+            step = Pos(current.x + dx, current.y + dy)
+            if step != goal and (step in blocked or not turn.land(step)):
+                continue
+            new_cost = cost + 1
+            if new_cost >= best.get(step, new_cost + 1):
+                continue
+            best[step] = new_cost
+            heappush(
+                frontier,
+                (new_cost + chebyshev(step, goal), new_cost, next(order), step),
+            )
+    return None
