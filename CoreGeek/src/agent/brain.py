@@ -330,8 +330,9 @@ def _worker_build_tower(turn, role, sites, free_towers, claimed, commands):
             if _build_failures.get(key, 0) >= MAX_BUILD_FAILURES:
                 continue  # 该位置反复失败，跳过
             tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
-            _build_or_walk(turn, role, site, tower_name, claimed, commands)
-            return
+            if _build_or_walk(turn, role, site, tower_name, claimed, commands):
+                return
+            # 寻路失败 → 继续尝试下一个位置
     _mine_stone(turn, role, claimed, commands)
 
 
@@ -342,8 +343,8 @@ def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
         for idx, site in enumerate(_tower_sites(turn)):
             if site in free_towers and site not in claimed:
                 tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
-                _build_or_walk(turn, role, site, tower_name, claimed, commands)
-                return
+                if _build_or_walk(turn, role, site, tower_name, claimed, commands):
+                    return
     # 前2天且石头不够 → 先挖够石头再建墙
     stones = role.backpack.count(WALL_MATERIAL)
     day = turn.day_number
@@ -355,8 +356,8 @@ def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
     if stones > 0 and free_walls:
         for site in free_walls:
             if site not in claimed:
-                _build_or_walk(turn, role, site, WALL, claimed, commands)
-                return
+                if _build_or_walk(turn, role, site, WALL, claimed, commands):
+                    return
     # 背包满就去卖
     if role.backpack_almost_full:
         _go_sell(turn, role, claimed, commands)
@@ -372,8 +373,8 @@ def _worker_miner_seller(turn, role, free_towers, claimed, commands):
         for idx, site in enumerate(_tower_sites(turn)):
             if site in free_towers and site not in claimed:
                 tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
-                _build_or_walk(turn, role, site, tower_name, claimed, commands)
-                return
+                if _build_or_walk(turn, role, site, tower_name, claimed, commands):
+                    return
     # 背包≥50%才去卖
     if role.backpack_almost_full:
         _go_sell(turn, role, claimed, commands)
@@ -1072,13 +1073,20 @@ def _try_use_upgrade_vouchers(turn, role, commands):
 
 
 def _build_or_walk(turn, role, target, name, claimed, commands):
+    """走向目标并建造。返回 True=已发命令，False=无法移动/建造"""
     if role.pos != target and chebyshev(role.pos, target) <= 1:
         commands[role.unit_id] = build_command(target, name)
         claimed.add(target)
-        return
+        return True
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+        return True
+    # 寻路失败 → 记录失败，下次跳过此位置
+    key = (target.x, target.y)
+    _build_failures[key] = _build_failures.get(key, 0) + 1
+    LOGGER.info("pathfinding failed to %s for %s (failures=%d)", target, name, _build_failures[key])
+    return False
 
 
 def _step_toward(turn, role, target, claimed):
