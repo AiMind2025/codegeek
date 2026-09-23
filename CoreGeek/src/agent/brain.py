@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from .grid import next_step
+from .lore import append_folklore, get_all_folklore
 from .protocol import (
     PIONEER,
     ROBOT_THREAT_PRIORITY,
@@ -163,7 +164,7 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     except Exception as e:
         LOGGER.exception("day/night decision failed: %s", e)
 
-    # 收集 LLM prompt
+    # 收集 LLM prompt + executeCmd
     try:
         prompt = (
             getattr(_pioneer_do_task, "_pending_prompt", "")
@@ -171,12 +172,15 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         )
         _pioneer_do_task._pending_prompt = ""
         _try_summon_treasure._pending_prompt = ""
+        execute_cmd = getattr(_pioneer_do_task, "_pending_exec_cmd", "")
+        _pioneer_do_task._pending_exec_cmd = ""
         retry_hint = _retry_hint(turn)
         if retry_hint and not prompt and _can_use_llm(turn):
             prompt = retry_hint
             _record_llm_call(turn)
     except Exception as e:
         LOGGER.exception("prompt collection failed: %s", e)
+        execute_cmd = ""
 
     # ══ 最终兜底：无论发生什么，确保每回合至少每个可控角色有一条命令 ═══
     try:
@@ -197,7 +201,7 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {
         "roleCommandMap": {str(k): v for k, v in commands.items()},
         "prompt": prompt,
-        "executeCmd": "",
+        "executeCmd": execute_cmd,
     }
 
 
@@ -229,6 +233,9 @@ def _retry_hint(turn: Turn) -> str:
 
 
 def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
+    # 积累民间传闻（用于宝藏召唤）
+    append_folklore(turn.folk_legends)
+
     tower_sites = _tower_sites(turn)
     wall_order = _wall_order(turn)
     standing_towers = {u.pos for u in turn.weapons()}
@@ -382,48 +389,108 @@ def _pioneer_day(turn, role, claimed, commands):
     _pioneer_idle(turn, role, claimed, commands)
 
 
-# ── 开拓者任务系统 ─────────────────────────────────────
+# ─ 开拓者任务系统（executeCmd 沙盒闭环） ────────────────
 
-_pioneer_empty_resp_count = 0
-MAX_EMPTY_LLM_RESP = 3
+# executeCmd 状态追踪
+_exec_prev_result: str = ""
+_exec_sent_cmd: bool = False
+_exec_retry_count: int = 0
+_MAX_EXECUTE_RETRY: int = 8
 
 
-def _pioneer_do_task(turn, role, claimed, commands):
-    """执行已领取的自进化任务：用 LLM 获取答案并提交"""
-    global _pioneer_empty_resp_count
+def _pioneer_do_task(turn: Turn, role: Unit, claimed: set, commands: dict) -> None:
+    """自进化任务：LLM 指挥沙盒 executeCmd，多轮交互直到得出答案"""
+    global _exec_prev_result, _exec_sent_cmd, _exec_retry_count
+
     task = turn.phase_task
     if not task:
-        _pioneer_empty_resp_count = 0
+        _exec_prev_result = ""
+        _exec_sent_cmd = False
+        _exec_retry_count = 0
         return
 
-    # 如果背包中有 Medicine 且血量低，先用药
-    if "Medicine" in role.backpack and role.health < 110:
-        commands[role.unit_id] = use_command("Medicine")
+    last_cmd = turn.last_cmd_result
+
+    # 结果没变 → 还在等上一条命令执行，原地等待
+    if _exec_sent_cmd and last_cmd == _exec_prev_result:
+        _exec_retry_count += 1
+        commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
         return
 
-    # 上回合 LLM 返回了答案，直接提交
-    if turn.llm_resp and turn.llm_resp.strip():
-        _pioneer_empty_resp_count = 0
-        commands[role.unit_id] = submit_answer_command(turn.llm_resp)
-        return
+    # 新结果（或首次）→ 调用 LLM 决定下一步
+    _exec_prev_result = last_cmd
+    _exec_sent_cmd = True
 
-    # LLM 返回为空，计数
-    _pioneer_empty_resp_count += 1
+    output_hint = ""
+    if last_cmd:
+        output_hint = f"\n上一条命令输出：\n{last_cmd}\n"
+    elif _exec_retry_count > 0:
+        output_hint = "\n上一条命令无输出（可能命令有误或文件不存在），请换一种方式。\n"
 
-    # 连续多次空响应 → 提交占位答案，避免卡死
-    if _pioneer_empty_resp_count >= MAX_EMPTY_LLM_RESP:
-        _pioneer_empty_resp_count = 0
-        commands[role.unit_id] = submit_answer_command("N/A")
-        return
-
-    # 任务期间 LLM 不限次数，发送 prompt
     prompt = (
-        f"你是一个自进化AI助手。当前任务：\n{task}\n\n"
-        f"请给出简洁的答案，只输出答案内容，不要解释。"
+        f"你在沙盒中执行自进化任务。沙盒是 Linux，有 python3/bash，无外网。\n"
+        f"任务文件在 /tmp/selfEvolutionTask/ 下，必须用绝对路径。\n"
+        f"\n当前任务：\n{task}"
+        f"{output_hint}"
+        f"\n请输出一行 JSON（不要其他内容）：\n"
+        f'{{"executeCmd":"下一条shell/python命令 或 空字符串", '
+        f'"taskAnswer":"若已得出最终答案则填写，否则空字符串"}}\n'
+        f"规则：\n"
+        f"1. 先用 find/ls 查看任务目录，再 cat 任务文件\n"
+        f"2. 根据任务要求执行操作，收集信息\n"
+        f"3. 得出答案后 taskAnswer 填写答案，executeCmd 留空\n"
+        f"4. 不要重复已经失败的命令"
     )
+
     _pioneer_do_task._pending_prompt = prompt
     _record_llm_call(turn)
+
+    # 同时发送 executeCmd（如果 LLM 上一轮给了命令）
+    # 注意：executeCmd 只能从 payload 获取（lastCmdResult），LLM 的命令通过 prompt 传递
+    # 所以第一轮我们先发 prompt，下回合 LLM 回答后我们再发 executeCmd
+    # 这里用 prompt 机制：本回合发 prompt，下回合读 llmResp
+    if turn.llm_resp and turn.llm_resp.strip():
+        # 上回合 LLM 已经回答了，解析 executeCmd / taskAnswer
+        parsed = _parse_execute_response(turn.llm_resp)
+        if parsed["executeCmd"]:
+            # 需要执行命令，但 executeCmd 只能在 response 中发
+            # 所以我们将命令存起来，通过 _pioneer_do_task 的返回值传递
+            _pioneer_do_task._pending_exec_cmd = parsed["executeCmd"]
+        if parsed["taskAnswer"]:
+            commands[role.unit_id] = submit_answer_command(parsed["taskAnswer"])
+            _exec_sent_cmd = False
+            _exec_retry_count = 0
+            return
+    else:
+        _pioneer_do_task._pending_exec_cmd = ""
+
     commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
+
+
+# 存储待执行的沙盒命令和 LLM prompt
+_pioneer_do_task._pending_exec_cmd = ""
+
+
+def _parse_execute_response(text: str) -> dict[str, str]:
+    """解析 LLM 返回的 executeCmd/taskAnswer JSON"""
+    import json, re
+    text = text.strip()
+    # 去掉 markdown 代码围栏
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+    # 找 JSON 对象
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return {"executeCmd": "", "taskAnswer": ""}
+    try:
+        data = json.loads(m.group(0))
+        return {
+            "executeCmd": str(data.get("executeCmd", "")),
+            "taskAnswer": str(data.get("taskAnswer", "")),
+        }
+    except json.JSONDecodeError:
+        return {"executeCmd": "", "taskAnswer": ""}
 
 
 # 存储待发送的 prompt
@@ -520,8 +587,8 @@ _ALL_TASK_ITEMS = (
 
 
 def _try_summon_treasure(turn, role, claimed, commands):
-    """尝试召唤宝藏：解析传闻 → 定位祭坛 → 带齐物品 → 召唤"""
-    legends = turn.folk_legends
+    """尝试召唤宝藏：用累计传闻解析 → 定位祭坛 → 带齐物品 → 召唤"""
+    legends = get_all_folklore()
     if not legends:
         return False
 
@@ -538,7 +605,7 @@ def _try_summon_treasure(turn, role, claimed, commands):
         return False
 
     prompt = (
-        f"分析以下民间传闻，提取宝藏信息：\n{legends}\n\n"
+        f"以下是多天积累的民间传闻，综合分析提取宝藏信息：\n{legends}\n\n"
         f"输出JSON格式：\n"
         f'{{"altar_pos": {{"x": int, "y": int}}, '
         f'"required_items": ["item1", "item2", ...], '

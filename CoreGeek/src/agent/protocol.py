@@ -232,6 +232,7 @@ class Turn:
     team_type: str
     player_tasks: tuple
     llm_resp: str
+    last_cmd_result: str
 
     @classmethod
     def load(cls, payload):
@@ -254,6 +255,7 @@ class Turn:
             for pt in (team.get("playerTasks") or [])
         )
         llm_resp = str(payload.get("llmResp") or "")
+        last_cmd_result = str(payload.get("lastCmdResult") or "")
         return cls(
             round_no,
             (round_no - 1) % ROUNDS_PER_DAY < DAY_ROUNDS,
@@ -278,6 +280,7 @@ class Turn:
             str(team.get("type") or ""),
             player_tasks,
             llm_resp,
+            last_cmd_result,
         )
 
     @property
