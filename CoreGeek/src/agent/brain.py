@@ -384,10 +384,16 @@ def _pioneer_day(turn, role, claimed, commands):
 
 # ── 开拓者任务系统 ─────────────────────────────────────
 
+_pioneer_empty_resp_count = 0
+MAX_EMPTY_LLM_RESP = 3
+
+
 def _pioneer_do_task(turn, role, claimed, commands):
     """执行已领取的自进化任务：用 LLM 获取答案并提交"""
+    global _pioneer_empty_resp_count
     task = turn.phase_task
     if not task:
+        _pioneer_empty_resp_count = 0
         return
 
     # 如果背包中有 Medicine 且血量低，先用药
@@ -396,11 +402,21 @@ def _pioneer_do_task(turn, role, claimed, commands):
         return
 
     # 上回合 LLM 返回了答案，直接提交
-    if turn.llm_resp:
+    if turn.llm_resp and turn.llm_resp.strip():
+        _pioneer_empty_resp_count = 0
         commands[role.unit_id] = submit_answer_command(turn.llm_resp)
         return
 
-    # 任务期间 LLM 不限次数
+    # LLM 返回为空，计数
+    _pioneer_empty_resp_count += 1
+
+    # 连续多次空响应 → 提交占位答案，避免卡死
+    if _pioneer_empty_resp_count >= MAX_EMPTY_LLM_RESP:
+        _pioneer_empty_resp_count = 0
+        commands[role.unit_id] = submit_answer_command("N/A")
+        return
+
+    # 任务期间 LLM 不限次数，发送 prompt
     prompt = (
         f"你是一个自进化AI助手。当前任务：\n{task}\n\n"
         f"请给出简洁的答案，只输出答案内容，不要解释。"
@@ -996,6 +1012,7 @@ def _tower_sites(turn):
 
 
 def _wall_order(turn):
+    """围墙建造顺序：左侧优先（机器人主要攻击方向），扩展到距离2覆盖更大范围"""
     station = turn.station()
     if station is None:
         return []
@@ -1004,11 +1021,18 @@ def _wall_order(turn):
     ys = [pos.y for pos in footprint]
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
+    # 优先左侧（xmin方向），然后上、右、下；扩展到距离2
     order = [
-        *(Pos(x, ymin - 2) for x in range(xmax + 2, xmin - 3, -1)),
-        *(Pos(xmin - 2, y) for y in range(ymin - 1, ymax + 2)),
+        # 第1圈：左侧 → 上侧 → 右侧 → 下侧（入口除外）
+        *(Pos(xmin - 1, y) for y in range(ymax + 1, ymin - 2, -1)),
+        *(Pos(x, ymax + 1) for x in range(xmin - 1, xmax + 2)),
+        *(Pos(xmax + 1, y) for y in range(ymin - 1, ymax + 2)),
+        *(Pos(x, ymin - 1) for x in range(xmax + 1, xmin - 2, -1)),
+        # 第2圈：更外层，同样左侧优先
+        *(Pos(xmin - 2, y) for y in range(ymax + 2, ymin - 3, -1)),
         *(Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)),
-        *(Pos(xmax + 2, y) for y in range(ymax + 1, ymin - 2, -1)),
+        *(Pos(xmax + 2, y) for y in range(ymin - 2, ymax + 3)),
+        *(Pos(x, ymin - 2) for x in range(xmax + 2, xmin - 3, -1)),
     ]
     entrance = Pos(xmax + 2, ymin - 1)
     return [pos for pos in order if pos != entrance and turn.land(pos)]
