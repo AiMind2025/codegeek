@@ -298,11 +298,10 @@ def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
         except Exception as e:
             LOGGER.exception("pioneer day failed (id=%s): %s", pioneer.unit_id, e)
 
-    # ─ 安全网：如果没有任何命令，给每个可控角色发原地待命 ──
-    if not commands:
-        for role in turn.controllable():
-            if role.unit_id not in commands:
-                commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
+    #  安全网：确保每个可控角色都有命令 ─
+    for role in turn.controllable():
+        if role.unit_id not in commands:
+            commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
     # ── 提前回防：夜晚来临前5回合，工人走向武器 ──
     if turn.round_in_day >= 65:
@@ -716,18 +715,31 @@ def _night(turn, commands):
         if role.unit_id in commands:
             continue  # 已用物品，跳过
         if i >= len(weapons):
-            continue  # 武器不够，该角色闲置
+            # 武器不够 → 移动到最近武器旁
+            if weapons:
+                nearest = min(weapons, key=lambda w: chebyshev(role.pos, w.pos))
+                step = _step_toward(turn, role, nearest.pos, set())
+                if step:
+                    commands[role.unit_id] = move_command(step)
+            continue
         weapon = weapons[i]
-        # 不在武器旁 → 夜晚不走动，跳过
-        if chebyshev(role.pos, weapon.pos) > 1:
-            continue
-        # 冷却中 → 不攻击
-        if weapon.cooldown > 0:
-            continue
-        # 选择目标攻击
-        targets = _select_attack_targets(weapon, enemy_robots, turn)
-        if targets:
-            commands[weapon.unit_id] = attack_command(role.unit_id, targets)
+        if chebyshev(role.pos, weapon.pos) <= 1:
+            # 在武器旁
+            if weapon.cooldown > 0:
+                continue  # 冷却中，跳过
+            targets = _select_attack_targets(weapon, enemy_robots, turn)
+            if targets:
+                commands[weapon.unit_id] = attack_command(role.unit_id, targets)
+        else:
+            # 不在武器旁 → 夜晚也走向武器
+            step = _step_toward(turn, role, weapon.pos, set())
+            if step:
+                commands[role.unit_id] = move_command(step)
+
+    # 安全网：夜晚无命令时原地待命
+    if not commands:
+        for role in controllable:
+            commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
 
 
 def _best_unassigned_weapon(role, weapons, assigned_weapons):
