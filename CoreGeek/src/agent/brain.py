@@ -189,15 +189,14 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         LOGGER.exception("prompt collection failed: %s", e)
         execute_cmd = ""
 
-    # ══ 最终兜底：无论发生什么，确保每回合至少每个可控角色有一条命令 ═══
+    # ══ 最终兜底：确保每个可控角色都有命令 ══
     try:
-        if not commands:
-            for role in turn.controllable():
-                if role.unit_id not in commands:
-                    commands[role.unit_id] = {
-                        "action": "move",
-                        "targetPos": [role.pos.dump()],
-                    }
+        for role in turn.controllable():
+            if role.unit_id not in commands:
+                commands[role.unit_id] = {
+                    "action": "move",
+                    "targetPos": [role.pos.dump()],
+                }
     except Exception as e:
         LOGGER.exception("fallback commands failed: %s", e)
 
@@ -431,6 +430,9 @@ def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
     if free_towers and turn.gold >= WEAPON_BUILD_COST:
         for site in _tower_sites(turn):
             if site in free_towers and site not in claimed:
+                key = (site.x, site.y)
+                if _build_failures.get(key, 0) >= MAX_BUILD_FAILURES:
+                    continue  # 该位置已熔断
                 idx = _tower_sites(turn).index(site)
                 if _build_or_walk(turn, role, site, TOWER_LOADOUT[idx % 3], claimed, commands):
                     return
@@ -462,6 +464,9 @@ def _worker_miner_seller(turn, role, free_towers, claimed, commands):
     if free_towers and turn.gold >= WEAPON_BUILD_COST:
         for site in _tower_sites(turn):
             if site in free_towers and site not in claimed:
+                key = (site.x, site.y)
+                if _build_failures.get(key, 0) >= MAX_BUILD_FAILURES:
+                    continue  # 该位置已熔断
                 idx = _tower_sites(turn).index(site)
                 if _build_or_walk(turn, role, site, TOWER_LOADOUT[idx % 3], claimed, commands):
                     return
@@ -543,6 +548,12 @@ def _pioneer_do_task(turn: Turn, role: Unit, claimed: set, commands: dict) -> No
     if _exec_sent_cmd and last_cmd == _exec_prev_result:
         _exec_retry_count += 1
         LOGGER.info("TASK_WAIT role=%d retry=%d last_cmd=%s", role.unit_id, _exec_retry_count, repr(last_cmd[:80]))
+        # 超时放弃任务
+        if _exec_retry_count >= 30:
+            LOGGER.warning("TASK_TIMEOUT role=%d after %d retries, abandoning", role.unit_id, _exec_retry_count)
+            _exec_prev_result = ""
+            _exec_sent_cmd = False
+            _exec_retry_count = 0
         commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
         return
 
@@ -850,201 +861,9 @@ def _parse_treasure_response(text):
 _try_summon_treasure._pending_prompt = ""
 
 
-def _auto_retry(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
-    """上回合失败指令的记录（实际替代方案由 _day/_night 中的 fallback 处理）"""
-    # 只做日志记录，不在此发命令（避免与 _day/_night 冲突）
-    for uid, ok in turn.last_action_results.items():
-        if not ok:
-            LOGGER.info("last round action failed for role %s", uid)
-
-
-def _retry_hint(turn: Turn) -> str:
-    """根据上回合失败结果生成 LLM 重试提示"""
-    failed = [uid for uid, ok in turn.last_action_results.items() if not ok]
-    if not failed:
-        return ""
-    failed_types = []
-    for uid in failed:
-        for unit in turn.ours:
-            if unit.unit_id == uid:
-                failed_types.append(f"{unit.kind}(id={uid})")
-                break
-    if not failed_types:
-        return ""
-    return (
-        f"上回合以下角色指令执行失败：{', '.join(failed_types)}。"
-        f"请分析可能原因并给出替代方案。"
-    )
-
-
-def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
-    # 积累民间传闻（用于宝藏召唤）
-    append_folklore(turn.folk_legends)
-
-    tower_sites = _tower_sites(turn)
-    wall_order = _wall_order(turn)
-    standing_towers = {u.pos for u in turn.weapons()}
-    standing_walls = {u.pos for u in turn.walls()}
-    occupied = turn.occupied_cells()
-    towers_missing = [p for p in tower_sites if p not in standing_towers]
-    walls_missing = [p for p in wall_order if p not in standing_walls]
-    free_towers = [p for p in towers_missing if p not in occupied]
-    free_walls = [p for p in walls_missing if p not in occupied]
-
-    claimed: set[Pos] = set()
-    workers = turn.workers()
-    day = turn.day_number
-
-    # 每个工人独立 try，一个失败不影响另一个
-    station = turn.station()
-    base_hp = station.health if station else 1500
-
-    # 基地紧急模式：HP<500 时所有工人停止采矿，全力建墙
-    if base_hp < 500 and free_walls:
-        for w in workers:
-            try:
-                for site in free_walls:
-                    if site not in claimed:
-                        _build_or_walk(turn, w, site, WALL, claimed, commands)
-                        break
-            except Exception as e:
-                LOGGER.exception("emergency wall build failed (id=%s): %s", w.unit_id, e)
-        # 紧急模式下跳过正常工人逻辑
-    elif day <= 2:
-        # 前两天：工人1建炮台，工人2采石头备料
-        if len(workers) >= 1:
-            try:
-                _worker_builder(turn, workers[0], free_towers, free_walls, claimed, commands)
-            except Exception as e:
-                LOGGER.exception("worker builder failed (id=%s): %s", workers[0].unit_id, e)
-        if len(workers) >= 2:
-            try:
-                _mine_stone(turn, workers[1], claimed, commands)
-            except Exception as e:
-                LOGGER.exception("worker stone failed (id=%s): %s", workers[1].unit_id, e)
-    else:
-        # 工人1：采石头 + 建围墙
-        if len(workers) >= 1:
-            try:
-                _worker_builder(turn, workers[0], free_towers, free_walls, claimed, commands)
-            except Exception as e:
-                LOGGER.exception("worker builder failed (id=%s): %s", workers[0].unit_id, e)
-        # 工人2：采铜铁 + 售卖
-        if len(workers) >= 2:
-            try:
-                _worker_miner_seller(turn, workers[1], free_towers, claimed, commands)
-            except Exception as e:
-                LOGGER.exception("worker miner_seller failed (id=%s): %s", workers[1].unit_id, e)
-
-    pioneer = _find_pioneer(turn)
-    if pioneer is not None:
-        try:
-            _pioneer_day(turn, pioneer, claimed, commands)
-        except Exception as e:
-            LOGGER.exception("pioneer day failed (id=%s): %s", pioneer.unit_id, e)
-
-    #  安全网：确保每个可控角色都有命令 ─
-    for role in turn.controllable():
-        if role.unit_id not in commands:
-            commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
-
-    # ── 动态回防：每人计算自己的deadline ──
-    for role in turn.controllable():
-        if role.unit_id in commands:
-            continue
-        if _is_defend_time(turn, role):
-            _return_to_defend(turn, role, claimed, commands)
-
-
 # ── 建造失败追踪（避免同一位置反复失败） ──
 _build_failures: dict[tuple, int] = {}
 MAX_BUILD_FAILURES = 3
-
-
-def _worker_build_tower(turn, role, sites, free_towers, claimed, commands):
-    for idx, site in enumerate(sites):
-        if site in free_towers and site not in claimed:
-            key = (site.x, site.y)
-            if _build_failures.get(key, 0) >= MAX_BUILD_FAILURES:
-                continue  # 该位置反复失败，跳过
-            tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
-            if _build_or_walk(turn, role, site, tower_name, claimed, commands):
-                return
-            # 寻路失败 → 继续尝试下一个位置
-    _mine_stone(turn, role, claimed, commands)
-
-
-def _worker_builder(turn, role, free_towers, free_walls, claimed, commands):
-    """工人1：专挖石头 + 建围墙 + 建炮台（前2回合优先挖2个石头）"""
-    # 建炮台优先
-    if free_towers and turn.gold >= WEAPON_BUILD_COST:
-        for idx, site in enumerate(_tower_sites(turn)):
-            if site in free_towers and site not in claimed:
-                tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
-                if _build_or_walk(turn, role, site, tower_name, claimed, commands):
-                    return
-    # 前2天且石头不够 → 先挖够石头再建墙
-    stones = role.backpack.count(WALL_MATERIAL)
-    day = turn.day_number
-    round_in_day = turn.round_in_day
-    if day <= 2 and round_in_day <= 10 and stones < 2:
-        _mine_stone(turn, role, claimed, commands)
-        return
-    # 有石头就建墙
-    if stones > 0 and free_walls:
-        for site in free_walls:
-            if site not in claimed:
-                if _build_or_walk(turn, role, site, WALL, claimed, commands):
-                    return
-    # 背包满就去卖
-    if role.backpack_almost_full:
-        _go_sell(turn, role, claimed, commands)
-        return
-    # 兜底：持续挖石头
-    _mine_stone(turn, role, claimed, commands)
-
-
-def _worker_miner_seller(turn, role, free_towers, claimed, commands):
-    """工人2：专挖铜/铁 → 背包满50%去卖 → 回来继续采（持续循环）"""
-    # 建炮台优先
-    if free_towers and turn.gold >= WEAPON_BUILD_COST:
-        for idx, site in enumerate(_tower_sites(turn)):
-            if site in free_towers and site not in claimed:
-                tower_name = TOWER_LOADOUT[idx % len(TOWER_LOADOUT)]
-                if _build_or_walk(turn, role, site, tower_name, claimed, commands):
-                    return
-    # 背包≥50%才去卖
-    if role.backpack_almost_full:
-        _go_sell(turn, role, claimed, commands)
-        return
-    # 专挖铜（价值最高）
-    copper = role.backpack.count("copper")
-    if copper < 15:
-        _mine_ore(turn, role, "copper", claimed, commands)
-        return
-    # 再挖铁
-    iron = role.backpack.count("iron")
-    if iron < 15:
-        _mine_ore(turn, role, "iron", claimed, commands)
-        return
-    # 铜铁够了挖石头
-    _mine_stone(turn, role, claimed, commands)
-
-
-def _pioneer_day(turn, role, claimed, commands):
-    # 1. 如果有正在执行的任务，提交答案
-    if turn.has_active_task():
-        _pioneer_do_task(turn, role, claimed, commands)
-        return
-
-    # 2. 有可领取的任务，前往任务点领取
-    valid_tasks = turn.valid_tasks()
-    if valid_tasks:
-        _pioneer_go_task(turn, role, valid_tasks, claimed, commands)
-        return
-
-    # 3. 没有任务时：购买任务用品 + 探索
-    _pioneer_idle(turn, role, claimed, commands)
 
 
 # ─ 开拓者任务系统（executeCmd 沙盒闭环） ────────────────
@@ -1056,192 +875,15 @@ _exec_retry_count: int = 0
 _MAX_EXECUTE_RETRY: int = 8
 
 
-def _pioneer_do_task(turn: Turn, role: Unit, claimed: set, commands: dict) -> None:
-    """自进化任务：LLM 指挥沙盒 executeCmd，多轮交互直到得出答案"""
-    global _exec_prev_result, _exec_sent_cmd, _exec_retry_count
-
-    task = turn.phase_task
-    if not task:
-        _exec_prev_result = ""
-        _exec_sent_cmd = False
-        _exec_retry_count = 0
-        return
-
-    last_cmd = turn.last_cmd_result
-
-    # 结果没变 → 还在等上一条命令执行，原地等待
-    if _exec_sent_cmd and last_cmd == _exec_prev_result:
-        _exec_retry_count += 1
-        LOGGER.info("TASK_WAIT role=%d retry=%d last_cmd=%s", role.unit_id, _exec_retry_count, repr(last_cmd[:80]))
-        commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
-        return
-
-    # 新结果（或首次）→ 调用 LLM 决定下一步
-    _exec_prev_result = last_cmd
-    _exec_sent_cmd = True
-
-    LOGGER.info("TASK_CALL_LLM role=%d task=%s last_cmd=%s", role.unit_id, task[:60], repr(last_cmd[:80]))
-
-    output_hint = ""
-    if last_cmd:
-        output_hint = f"\n上一条命令输出：\n{last_cmd}\n"
-    elif _exec_retry_count > 0:
-        output_hint = "\n上一条命令无输出（可能命令有误或文件不存在），请换一种方式。\n"
-
-    prompt = (
-        f"你在沙盒中执行自进化任务。沙盒是 Linux，有 python3/bash，无外网。\n"
-        f"任务文件在 /tmp/selfEvolutionTask/ 下，必须用绝对路径。\n"
-        f"\n当前任务：\n{task}"
-        f"{output_hint}"
-        f"\n请输出一行 JSON（不要其他内容）：\n"
-        f'{{"executeCmd":"下一条shell/python命令 或 空字符串", '
-        f'"taskAnswer":"若已得出最终答案则填写，否则空字符串"}}\n'
-        f"规则：\n"
-        f"1. 先用 find/ls 查看任务目录，再 cat 任务文件\n"
-        f"2. 根据任务要求执行操作，收集信息\n"
-        f"3. 得出答案后 taskAnswer 填写答案，executeCmd 留空\n"
-        f"4. 不要重复已经失败的命令"
-    )
-
-    _pioneer_do_task._pending_prompt = prompt
-    _record_llm_call(turn)
-
-    # 同时发送 executeCmd（如果 LLM 上一轮给了命令）
-    # 注意：executeCmd 只能从 payload 获取（lastCmdResult），LLM 的命令通过 prompt 传递
-    # 所以第一轮我们先发 prompt，下回合 LLM 回答后我们再发 executeCmd
-    # 这里用 prompt 机制：本回合发 prompt，下回合读 llmResp
-    if turn.llm_resp and turn.llm_resp.strip():
-        # 上回合 LLM 已经回答了，解析 executeCmd / taskAnswer
-        parsed = _parse_execute_response(turn.llm_resp)
-        LOGGER.info("TASK_LLM_RESP role=%d exec=%s answer=%s", role.unit_id, repr(parsed["executeCmd"][:80]), repr(parsed["taskAnswer"][:80]))
-        if parsed["executeCmd"]:
-            # 需要执行命令，但 executeCmd 只能在 response 中发
-            # 所以我们将命令存起来，通过 _pioneer_do_task 的返回值传递
-            _pioneer_do_task._pending_exec_cmd = parsed["executeCmd"]
-        if parsed["taskAnswer"]:
-            commands[role.unit_id] = submit_answer_command(parsed["taskAnswer"])
-            _log_decision(role.unit_id, "submitAnswer", parsed["taskAnswer"][:80])
-            _exec_sent_cmd = False
-            _exec_retry_count = 0
-            return
-    else:
-        _pioneer_do_task._pending_exec_cmd = ""
-
-    commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
-
-
 # 存储待执行的沙盒命令和 LLM prompt
 _pioneer_do_task._pending_exec_cmd = ""
-
-
-def _parse_execute_response(text: str) -> dict[str, str]:
-    """解析 LLM 返回的 executeCmd/taskAnswer JSON"""
-    import json, re
-    text = text.strip()
-    # 去掉 markdown 代码围栏
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if m:
-        text = m.group(1).strip()
-    # 找 JSON 对象
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return {"executeCmd": "", "taskAnswer": ""}
-    try:
-        data = json.loads(m.group(0))
-        return {
-            "executeCmd": str(data.get("executeCmd", "")),
-            "taskAnswer": str(data.get("taskAnswer", "")),
-        }
-    except json.JSONDecodeError:
-        return {"executeCmd": "", "taskAnswer": ""}
 
 
 # 存储待发送的 prompt
 _pioneer_do_task._pending_prompt = ""
 
 
-def _pioneer_go_task(turn, role, valid_tasks, claimed, commands):
-    """前往任务点领取任务"""
-    # 选择奖励最高的有效任务
-    best = max(valid_tasks, key=lambda t: (t.score_reward, t.gold_reward))
-    target = best.task_position
-    LOGGER.info("TASK_GOTO role=%d target=%s type=%s reward=%d/%d", role.unit_id, target, best.task_type, best.score_reward, best.gold_reward)
-
-    # 任务点2占2格，到达任一格子即可
-    if chebyshev(role.pos, target) <= 1:
-        commands[role.unit_id] = accept_task_command()
-        _log_decision(role.unit_id, "acceptTask", f"at {target}")
-        return
-
-    step = _step_toward(turn, role, target, claimed)
-    if step is not None:
-        commands[role.unit_id] = move_command(step)
-        _log_decision(role.unit_id, "move", f"toward task {target}")
-
-
-def _pioneer_idle(turn, role, claimed, commands):
-    """开拓者空闲时：宝藏召唤 + 买任务用品 + 提前就位任务点 + 帮忙采石"""
-    # 0. 优先尝试宝藏召唤
-    if _try_summon_treasure(turn, role, claimed, commands):
-        return
-
-    shop = turn.weapon_shop_pos()
-
-    # 1. 购买任务用品（为下次召唤宝藏准备）
-    task_items = [
-        "AcientTablet", "StarSand", "FlameBreath",
-        "FrostPotion", "ThornAmulet", "IronWhistle",
-    ]
-    needed_items = [i for i in task_items if i not in role.backpack]
-
-    if needed_items and turn.gold >= 15 and shop:
-        if chebyshev(role.pos, shop) <= 1:
-            commands[role.unit_id] = buy_command(needed_items[0], 1)
-            return
-        else:
-            step = _step_toward(turn, role, shop, claimed)
-            if step is not None:
-                commands[role.unit_id] = move_command(step)
-                return
-
-    # 2. 冷却期间也往最近的任务点走（提前就位）
-    all_tasks = turn.player_tasks
-    if all_tasks:
-        # 选最近的任务点（即使还在冷却）
-        nearest_task = min(all_tasks, key=lambda t: chebyshev(role.pos, t.task_position))
-        if chebyshev(role.pos, nearest_task.task_position) > 1:
-            step = _step_toward(turn, role, nearest_task.task_position, claimed)
-            if step is not None:
-                commands[role.unit_id] = move_command(step)
-                return
-        # 已到任务点旁，但还在冷却 → 帮忙采石头
-        _mine_stone(turn, role, claimed, commands)
-        return
-
-    # 3. 完全没有任务点，往基地方向靠拢
-    station = turn.station()
-    if station and chebyshev(role.pos, station.pos) > 6:
-        step = _step_toward(turn, role, station.pos, claimed)
-        if step is not None:
-            commands[role.unit_id] = move_command(step)
-
-
 # ── 夜晚开拓者行为 ──────────────────────────────────────
-
-def _pioneer_night(turn, role, claimed, commands):
-    """夜晚开拓者应回到基地附近安全位置"""
-    station = turn.station()
-    if station is None:
-        return
-    # 优先回到有武器的位置
-    weapons = turn.weapons()
-    if weapons:
-        nearest_weapon = min(weapons, key=lambda w: chebyshev(role.pos, w.pos))
-        if chebyshev(role.pos, nearest_weapon.pos) > 1:
-            step = _step_toward(turn, role, nearest_weapon.pos, claimed)
-            if step is not None:
-                commands[role.unit_id] = move_command(step)
-
 
 # ── 宝藏召唤系统 ────────────────────────────────────────
 
@@ -1254,43 +896,6 @@ _ALL_TASK_ITEMS = (
 # 长上下文任务最早出现天数（attackmap=第8天, attackmap_update=第5天）
 # 用5作为下限，避免前几天浪费 LLM 配额
 _MIN_TREASURE_DAY = 5
-
-
-def _try_summon_treasure(turn, role, claimed, commands):
-    """尝试召唤宝藏：用累计传闻解析 → 定位祭坛 → 带齐物品 → 召唤"""
-    # 长上下文任务最早第5天才出现，之前不浪费 LLM 配额
-    if turn.day_number < _MIN_TREASURE_DAY:
-        return False
-    legends = get_all_folklore()
-    if not legends:
-        return False
-
-    # 上回合 LLM 返回了解析结果
-    if turn.llm_resp:
-        try:
-            return _process_treasure_llm_result(turn, role, claimed, commands)
-        except Exception as e:
-            LOGGER.exception("treasure llm result parse failed: %s", e)
-            return False
-
-    # 检查 LLM 配额（非任务期间每游戏日限3次）
-    if not _can_use_llm(turn):
-        return False
-
-    prompt = (
-        f"以下是多天积累的民间传闻，综合分析提取宝藏信息：\n{legends}\n\n"
-        f"输出JSON格式：\n"
-        f'{{"altar_pos": {{"x": int, "y": int}}, '
-        f'"required_items": ["item1", "item2", ...], '
-        f'"open_day": int 或 null}}\n'
-        f"如果信息不足以确定，required_items 列出所有6种任务用品。"
-    )
-    _try_summon_treasure._pending_prompt = prompt
-    _record_llm_call(turn)
-    return False
-
-
-_try_summon_treasure._pending_prompt = ""
 
 
 def _process_treasure_llm_result(turn, role, claimed, commands):
@@ -1727,17 +1332,27 @@ def _try_use_upgrade_vouchers(turn, role, commands):
 
 def _build_or_walk(turn, role, target, name, claimed, commands):
     """走向目标并建造。返回 True=已发命令，False=无法移动/建造"""
-    if role.pos != target and chebyshev(role.pos, target) <= 1:
+    # 前置校验：必须相邻才能建造
+    dist = chebyshev(role.pos, target)
+    if dist == 0:
+        # 角色站在目标上，无法建造
+        key = (target.x, target.y)
+        _build_failures[key] = _build_failures.get(key, 0) + 1
+        LOGGER.warning("BUILD_SKIP role=%d standing on target %s", role.unit_id, target)
+        return False
+    if dist <= 1:
+        # 相邻 → 发建造指令
         commands[role.unit_id] = build_command(target, name)
         claimed.add(target)
         _log_decision(role.unit_id, "build", f"{name} at {target}")
         return True
+    # 不相邻 → 走过去
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
         _log_decision(role.unit_id, "move", f"toward {target} for {name}")
         return True
-    # 寻路失败 → 记录失败，下次跳过此位置
+    # 寻路失败 → 记录失败
     key = (target.x, target.y)
     _build_failures[key] = _build_failures.get(key, 0) + 1
     LOGGER.warning("PATHFAIL role=%d target=%s for %s failures=%d pos=%s", role.unit_id, target, name, _build_failures[key], role.pos)
