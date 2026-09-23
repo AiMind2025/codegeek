@@ -35,6 +35,11 @@ from .protocol import (
 
 LOGGER = logging.getLogger(__name__)
 
+
+def _log_decision(role_id, action, detail=""):
+    """统一决策日志"""
+    LOGGER.info("DECIDE role=%d action=%s %s", role_id, action, detail)
+
 TOWER_LOADOUT = ("gatling", "railgun", "rocket")
 STONE_BATCH = 10
 _NEIGHBOUR_STEPS = (
@@ -434,12 +439,15 @@ def _pioneer_do_task(turn: Turn, role: Unit, claimed: set, commands: dict) -> No
     # 结果没变 → 还在等上一条命令执行，原地等待
     if _exec_sent_cmd and last_cmd == _exec_prev_result:
         _exec_retry_count += 1
+        LOGGER.info("TASK_WAIT role=%d retry=%d last_cmd=%s", role.unit_id, _exec_retry_count, repr(last_cmd[:80]))
         commands[role.unit_id] = {"action": "move", "targetPos": [role.pos.dump()]}
         return
 
     # 新结果（或首次）→ 调用 LLM 决定下一步
     _exec_prev_result = last_cmd
     _exec_sent_cmd = True
+
+    LOGGER.info("TASK_CALL_LLM role=%d task=%s last_cmd=%s", role.unit_id, task[:60], repr(last_cmd[:80]))
 
     output_hint = ""
     if last_cmd:
@@ -472,12 +480,14 @@ def _pioneer_do_task(turn: Turn, role: Unit, claimed: set, commands: dict) -> No
     if turn.llm_resp and turn.llm_resp.strip():
         # 上回合 LLM 已经回答了，解析 executeCmd / taskAnswer
         parsed = _parse_execute_response(turn.llm_resp)
+        LOGGER.info("TASK_LLM_RESP role=%d exec=%s answer=%s", role.unit_id, repr(parsed["executeCmd"][:80]), repr(parsed["taskAnswer"][:80]))
         if parsed["executeCmd"]:
             # 需要执行命令，但 executeCmd 只能在 response 中发
             # 所以我们将命令存起来，通过 _pioneer_do_task 的返回值传递
             _pioneer_do_task._pending_exec_cmd = parsed["executeCmd"]
         if parsed["taskAnswer"]:
             commands[role.unit_id] = submit_answer_command(parsed["taskAnswer"])
+            _log_decision(role.unit_id, "submitAnswer", parsed["taskAnswer"][:80])
             _exec_sent_cmd = False
             _exec_retry_count = 0
             return
@@ -522,15 +532,18 @@ def _pioneer_go_task(turn, role, valid_tasks, claimed, commands):
     # 选择奖励最高的有效任务
     best = max(valid_tasks, key=lambda t: (t.score_reward, t.gold_reward))
     target = best.task_position
+    LOGGER.info("TASK_GOTO role=%d target=%s type=%s reward=%d/%d", role.unit_id, target, best.task_type, best.score_reward, best.gold_reward)
 
     # 任务点2占2格，到达任一格子即可
     if chebyshev(role.pos, target) <= 1:
         commands[role.unit_id] = accept_task_command()
+        _log_decision(role.unit_id, "acceptTask", f"at {target}")
         return
 
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+        _log_decision(role.unit_id, "move", f"toward task {target}")
 
 
 def _pioneer_idle(turn, role, claimed, commands):
@@ -1077,15 +1090,17 @@ def _build_or_walk(turn, role, target, name, claimed, commands):
     if role.pos != target and chebyshev(role.pos, target) <= 1:
         commands[role.unit_id] = build_command(target, name)
         claimed.add(target)
+        _log_decision(role.unit_id, "build", f"{name} at {target}")
         return True
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+        _log_decision(role.unit_id, "move", f"toward {target} for {name}")
         return True
     # 寻路失败 → 记录失败，下次跳过此位置
     key = (target.x, target.y)
     _build_failures[key] = _build_failures.get(key, 0) + 1
-    LOGGER.info("pathfinding failed to %s for %s (failures=%d)", target, name, _build_failures[key])
+    LOGGER.warning("PATHFAIL role=%d target=%s for %s failures=%d pos=%s", role.unit_id, target, name, _build_failures[key], role.pos)
     return False
 
 
